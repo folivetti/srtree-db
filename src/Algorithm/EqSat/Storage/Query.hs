@@ -8,6 +8,7 @@
 module Algorithm.EqSat.Storage.Query
   ( topN
   , pareto
+  , paretoBySize
   , distributionCounts
   , countPattern
   ) where
@@ -47,6 +48,21 @@ pareto db = do
       dominates (f1, d1) (f0, d0) = f1 >= f0 && d1 <= d0 && (f1 > f0 || d1 < d0)
       nonDominated (eid_, f, d) = not (any (\(q0, qf, qd) -> dominates (qf, qd) (f, d)) pts)
   pure [ p | p@(_, f, d) <- pts, nonDominated p ]
+
+-- | Non-dominated classes over (max fitness, min size), matching the
+-- in-memory pareto front. Returns the (eid, fitness, size) triples that are
+-- not dominated by any other evaluated class.
+paretoBySize :: Database -> IO [(EClassId, Double, Int)]
+paretoBySize db = do
+  rows <- Store.query db
+    "SELECT eid, fitness, size FROM fit WHERE fitness IS NOT NULL" []
+  let pts = [ (Store.sqlToInt eid, f, s)
+            | [eid, ff, ss] <- rows
+            , Just f <- [Store.sqlToMaybeDouble ff]
+            , let s = Store.sqlToInt ss ]
+      dominates (f1, s1) (f0, s0) = f1 >= f0 && s1 <= s0 && (f1 > f0 || s1 < s0)
+      nonDominated (eid_, f, s) = not (any (\(q0, qf, qs) -> dominates (qf, qs) (f, s)) pts)
+  pure [ p | p@(_, f, s) <- pts, nonDominated p ]
 
 -- | Number of evaluated e-classes per model size (up to @maxSize@, inclusive).
 distributionCounts :: Database -> Int -> IO [(Int, Int)]
