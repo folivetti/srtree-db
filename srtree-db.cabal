@@ -3,9 +3,10 @@ name:          srtree-db
 version:       0.1.0.0
 synopsis:      SQL persistence and querying for srtree e-graphs
 description:   Reusable storage layer for srtree multiset e-graphs:
-               an SQLite-backed serialization (Algorithm.EqSat.Store rows)
-               plus SQL queries (topN, pareto, distribution counts, patterns).
-               Dataset-specific fit tables and a PostgreSQL backend come later.
+               a driver-neutral serialization of the Algorithm.EqSat.Store
+               rows (backed by SQLite and PostgreSQL) plus SQL queries
+               (topN, pareto, distribution counts, patterns).
+               Dataset-specific fit tables are a later phase.
 license:       BSD-3-Clause
 license-file:  LICENSE
 author:        Fabricio Olivetti de França
@@ -17,18 +18,43 @@ library
   hs-source-dirs:   src
   exposed-modules:
     Algorithm.EqSat.Storage.Types
+    Algorithm.EqSat.Storage.Backend
+    Algorithm.EqSat.Storage.ClassStore
+    Algorithm.EqSat.Storage.Import
     Algorithm.EqSat.Storage.Schema
     Algorithm.EqSat.Storage.SQLite
+    Algorithm.EqSat.Storage.Postgres
     Algorithm.EqSat.Storage.Query
   build-depends:
       base >=4.14 && <5
+    , bytestring
+    , binary
     , containers
     , unordered-containers
     , text
     , direct-sqlite
+    , postgresql-libpq
     , srtree
     , vector
     , mtl
+  default-language: Haskell2010
+
+benchmark srtree-db-bench
+  type:             exitcode-stdio-1.0
+  main-is:          Bench.hs
+  hs-source-dirs:   bench
+  ghc-options:      -O2
+  build-depends:
+      base
+    , bytestring
+    , containers
+    , text
+    , time
+    , directory
+    , direct-sqlite
+    , postgresql-libpq
+    , srtree
+    , srtree-db
   default-language: Haskell2010
 
 test-suite srtree-db-test
@@ -38,10 +64,14 @@ test-suite srtree-db-test
   build-depends:
       base
     , HUnit
+    , bytestring
+    , binary
     , containers
+    , directory
     , unordered-containers
     , text
     , direct-sqlite
+    , postgresql-libpq
     , srtree
     , srtree-db
     , vector
