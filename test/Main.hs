@@ -466,6 +466,47 @@ testPagedPushFit openDb closeDb = TestCase $ do
       assertEqual "paged push fitness read back" (Just 0.99) (evalIn eg2 (getFitness eidAdd))
   closeDb db
 
+-- | Frontier re-saturation: seed the @frontier@ table with only one of two
+-- mergeable pairs, run a frontier pass, and check that (a) the frontier class
+-- is re-saturated (its merge happens) while a mergeable pair outside the
+-- frontier is left untouched, and (b) the frontier is cleared afterwards. This
+-- is the "re-saturate only recently-changed classes, avoid redo" behaviour; the
+-- pure in-memory eggp loop and a full dbEqSat are unaffected.
+testFrontierReload :: SqlBackend db => IO db -> (db -> IO ()) -> Test
+testFrontierReload openDb closeDb = TestCase $ do
+  db <- openDb
+  let ((eidA, eidB, eidC, eidD), eg) = runIn emptyGraph $ do
+        eidA <- fromTree myCost (var 0 * var 0)   -- x0*x0   (mergeable, NOT in frontier)
+        eidB <- fromTree myCost (var 0 ** 2)      -- x0**2
+        eidC <- fromTree myCost (var 1 * var 1)   -- x1*x1   (mergeable, IN frontier)
+        eidD <- fromTree myCost (var 1 ** 2)      -- x1**2
+        pure (eidA, eidB, eidC, eidD)
+  _ <- saveGraphTest db eg
+  obj <- loadGraphLazy db 1
+  case obj of
+    Left err -> assertFailure ("loadGraphLazy failed: " <> err)
+    Right eg0 -> case _classStore eg0 of
+      Nothing -> assertFailure "frontier: expected a paged store"
+      Just h -> do
+        runDb db "INSERT INTO frontier (eid) VALUES (?)" [SqlInteger (fromIntegral eidC)]
+        (_, g1) <- runIOIn eg0 $ do
+          liftIO (cpsBeginFrontier h)
+          _ <- runEqSat myCost rewrites 20
+          liftIO (cpsEndFrontier h)
+          pure ()
+        -- the frontier class was re-saturated: x1*x1 merged into x1**2
+        (cC, _) <- runIOIn g1 (canonical eidC)
+        (cD, _) <- runIOIn g1 (canonical eidD)
+        assertEqual "frontier: x1*x1 merged into x1**2" cD cC
+        -- a mergeable pair OUTSIDE the frontier was left untouched
+        (cA, _) <- runIOIn g1 (canonical eidA)
+        (cB, _) <- runIOIn g1 (canonical eidB)
+        assertBool "frontier: x0*x0 NOT merged (outside frontier)" (cA /= cB)
+        -- the frontier was cleared after the pass
+        fr <- loadFrontierRows db
+        assertBool "frontier cleared after pass" (null fr)
+  closeDb db
+
 runPagedSuite :: SqlBackend db => String -> (IO db, db -> IO ()) -> [Test]
 runPagedSuite tag (openDb, closeDb) =
   [ TestLabel (tag <> " paged-roundtrip")   (testPagedRoundtrip openDb closeDb)
@@ -475,6 +516,7 @@ runPagedSuite tag (openDb, closeDb) =
   , TestLabel (tag <> " lazy-rewrite")      (testLazyRewrite openDb closeDb)
   , TestLabel (tag <> " paged-push-fit")    (testPagedPushFit openDb closeDb)
   , TestLabel (tag <> " paged-eqsat-reload") (testPagedEqSatReload openDb closeDb)
+  , TestLabel (tag <> " frontier")          (testFrontierReload openDb closeDb)
   ]
 
 runSuite :: SqlBackend db => String -> (IO db, db -> IO ()) -> [Test]

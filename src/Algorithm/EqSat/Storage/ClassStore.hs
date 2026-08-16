@@ -43,6 +43,12 @@ module Algorithm.EqSat.Storage.ClassStore
   , classStoreTable
   , openClassStore
   , classStoreHandle
+  , frontierTable
+  , markFrontier
+  , loadFrontierRows
+  , clearFrontier
+  , setFrontierActive
+  , initFrontier
   , hex
   , unhex
   ) where
@@ -146,6 +152,8 @@ data PageStore db = PageStore
   , psCache     :: !(IORef PageCache)
   , psNodes     :: !(IORef (Set.HashSet (Int, ENode))) -- newly-created nodes awaiting write-back
   , psCanon     :: !(IORef (IM.IntMap Int))            -- pending canonical (eid -> representative) rows
+  , psFrontier  :: !(IORef IntSet.IntSet)              -- recently-changed e-classes (dirty set)
+  , psFrontierActive :: !(IORef Bool)                  -- restrict the matcher to the frontier
   , psCap       :: !Int
   , psFlushEvery :: !Int
   }
@@ -163,7 +171,9 @@ newPageStore db tbl cap flushEvery' = do
   cache <- newIORef (emptyCache cap)
   nodes <- newIORef Set.empty
   canons <- newIORef IM.empty
-  pure (PageStore db tbl cache nodes canons cap flushEvery')
+  frontier <- newIORef IntSet.empty
+  active <- newIORef False
+  pure (PageStore db tbl cache nodes canons frontier active cap flushEvery')
 
 -- | Read the page for @eid@ (cache miss loads from the database). Refreshes
 -- LRU recency on hit so hot classes stay resident.
@@ -306,6 +316,58 @@ allPageKeys ps = do
 classStoreTable :: T.Text
 classStoreTable = "cstore_page"
 
+-- | Table holding the re-saturation frontier: e-classes that have been created
+-- or merged since the last frontier re-saturation pass, so a subsequent pass can
+-- re-saturate only these (and classes they touch) instead of the whole graph.
+frontierTable :: T.Text
+frontierTable = "frontier"
+
+-- | Mark an e-class as recently changed (part of the re-saturation frontier).
+markFrontier :: PageStore db -> Int -> IO ()
+markFrontier ps eid = modifyIORef' (psFrontier ps) (IntSet.insert eid)
+
+-- | Read the persisted frontier e-class ids (for initialising a pass).
+loadFrontierRows :: SqlBackend db => db -> IO [Int]
+loadFrontierRows db = do
+  rows <- queryDb db ("SELECT eid FROM " <> frontierTable) []
+  pure [ sqlToInt e | [e] <- rows ]
+
+-- | Whether the matcher's candidate-root enumeration is restricted to the
+-- frontier (a frontier re-saturation pass). Off by default (normal eqsat and
+-- the pure in-memory path are unaffected).
+setFrontierActive :: PageStore db -> Bool -> IO ()
+setFrontierActive ps a = writeIORef (psFrontierActive ps) a
+
+-- | Start a frontier re-saturation: seed the in-memory dirty set from the
+-- persisted frontier (or an explicit seed), and restrict the matcher to it.
+initFrontier :: SqlBackend db => PageStore db -> [Int] -> IO ()
+initFrontier ps seed = do
+  persisted <- loadFrontierRows (psDb ps)
+  writeIORef (psFrontier ps) (IntSet.fromList (persisted ++ seed))
+  writeIORef (psFrontierActive ps) True
+
+-- | End a frontier re-saturation: clear the persisted frontier and the
+-- in-memory dirty set, and lift the matcher restriction.
+clearFrontier :: SqlBackend db => PageStore db -> IO ()
+clearFrontier ps = do
+  runDb (psDb ps) ("DELETE FROM " <> frontierTable) []
+  writeIORef (psFrontier ps) IntSet.empty
+  writeIORef (psFrontierActive ps) False
+
+-- | Persist the in-memory frontier (recently-changed classes) to the frontier
+-- table, so it survives until the next re-saturation pass. Idempotent.
+flushFrontier :: SqlBackend db => PageStore db -> IO ()
+flushFrontier ps = do
+  f <- readIORef (psFrontier ps)
+  unless (IntSet.null f) $ do
+    let db = psDb ps
+    execDb db "BEGIN"
+    forM_ (IntSet.toList f) $ \eid ->
+      insertIgnore db ("frontier (eid, updated_at) VALUES (?, ?)")
+        [ SqlInteger (fromIntegral eid), SqlText (T.pack (show (0 :: Int))) ]
+    execDb db "COMMIT"
+    writeIORef (psFrontier ps) IntSet.empty
+
 -- | Open the e-class page store on 'classStoreTable', creating the table if
 -- missing. @cap@ bounds the LRU cache (0 = unbounded), @flushEvery'@ is the
 -- dirty-page threshold that triggers a batched write-back.
@@ -320,24 +382,29 @@ classStoreHandle ps = EClassPageStore
   { cpsLookup = \eid -> fmap (fmap (decode . BL.fromStrict)) (readPage ps eid)
   , cpsInsert = \ec -> writePage ps (_eClassId ec) (BL.toStrict (encode ec))
   , cpsDelete = \eid -> deletePage ps eid
-  , cpsFlush  = writeback ps >> pure ()
+  , cpsFlush  = writeback ps >> flushFrontier ps >> pure ()
   , cpsAll    = fmap (map (decode . BL.fromStrict . snd)) (allPages ps)
   , cpsKeys   = allPageKeys ps
   , cpsStreamRoots = \op budget exclude -> do
       -- Union the DB's operator index with any not-yet-flushed nodes, so the
       -- streaming matcher sees every live node (like the resident _patDB trie),
       -- not just the last flushed snapshot. Excluded (already-attempted) roots
-      -- are skipped so the per-rule budget advances to new roots. Memory is
-      -- O(budget + pending + size of exclude).
+      -- are skipped so the per-rule budget advances to new roots. When a
+      -- frontier re-saturation is active, roots are further restricted to the
+      -- frontier (recently-changed) e-classes. Memory is O(budget + pending +
+      -- size of exclude + size of frontier).
       dbRoots <- streamByOp (psDb ps) (T.pack (opDetailOf op)) budget exclude
       pend <- readIORef (psNodes ps)
+      active <- readIORef (psFrontierActive ps)
+      frontier <- readIORef (psFrontier ps)
       let detail = opDetailOf op
           ex = IntSet.fromList exclude
           pendRoots = [ eid | (eid, en) <- Set.toList pend
                             , enodeOpDetail en == detail
                             , not (IntSet.member eid ex) ]
-      pure (take budget (nub (pendRoots ++ dbRoots)))
-  , cpsRecordNode  = \en eid -> modifyIORef' (psNodes ps) (Set.insert (eid, en))
+          keep e = not active || IntSet.member e frontier
+      pure (take budget (filter keep (nub (pendRoots ++ dbRoots))))
+  , cpsRecordNode  = \en eid -> markFrontier ps eid >> modifyIORef' (psNodes ps) (Set.insert (eid, en))
   , cpsNodeToClass = \en -> do
       -- content-address lookup, seeing not-yet-flushed nodes first (live)
       pend <- readIORef (psNodes ps)
@@ -357,5 +424,7 @@ classStoreHandle ps = EClassPageStore
             "SELECT canonical FROM eclass WHERE eid = ?"
             [SqlInteger (fromIntegral eid)]
           pure (case rows of [[v]] -> Just (sqlToInt v); _ -> Nothing)
-  , cpsRecordCanonical = \eid canon -> modifyIORef' (psCanon ps) (IM.insert eid canon)
+  , cpsRecordCanonical = \eid canon -> markFrontier ps eid >> modifyIORef' (psCanon ps) (IM.insert eid canon)
+  , cpsBeginFrontier = initFrontier ps []
+  , cpsEndFrontier    = clearFrontier ps
   }
