@@ -67,7 +67,7 @@ import Algorithm.EqSat.Storage.Schema (createSchema, schemaSQL)
 
 -- | Default cache capacity (pages) for the lazily paged e-class store.
 defaultClassCap :: Int
-defaultClassCap = 100000
+defaultClassCap = 50000
 
 -- ---------------------------------------------------------------------------
 -- SQLite driver instance

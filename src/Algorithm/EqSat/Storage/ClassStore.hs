@@ -163,17 +163,24 @@ readPage ps eid = do
     Just (page, _) -> do
       writeIORef (psCache ps) (touch eid page c0)
       pure (Just page)
-    Nothing -> do
-      rows <- queryDb (psDb ps)
-                ("SELECT blob FROM " <> psTable ps <> " WHERE key = ?")
-                [SqlInteger (fromIntegral eid)]
-      case rows of
-        [] -> pure Nothing
-        [[SqlText hv]] -> do
-          let page = unhex hv
-          writeIORef (psCache ps) (insertEvict eid page c0)
-          pure (Just page)
-        _ -> fail "ClassStore.readPage: unexpected row shape"
+    Nothing -> case IM.lookup eid (pcPend c0) of
+      -- the page is dirty (written but not yet flushed) and was evicted from
+      -- the LRU cache; it is NOT in the database yet, so return it from the
+      -- pending set and restore it as resident.
+      Just page -> do
+        writeIORef (psCache ps) (insertEvict eid page c0)
+        pure (Just page)
+      Nothing -> do
+        rows <- queryDb (psDb ps)
+                  ("SELECT blob FROM " <> psTable ps <> " WHERE key = ?")
+                  [SqlInteger (fromIntegral eid)]
+        case rows of
+          [] -> pure Nothing
+          [[SqlText hv]] -> do
+            let page = unhex hv
+            writeIORef (psCache ps) (insertEvict eid page c0)
+            pure (Just page)
+          _ -> fail "ClassStore.readPage: unexpected row shape"
 
 -- | Write the page for @eid@ (resident + marked dirty). Triggers a batched
 -- write-back once @flushEvery@ dirty pages have accumulated on a write.
@@ -234,6 +241,15 @@ allPages ps = do
   rows <- queryDb (psDb ps) ("SELECT key, blob FROM " <> psTable ps) []
   pure [ (sqlToInt k, unhex (sqlToText b)) | [k, b] <- rows ]
 
+-- | Read every e-class id currently stored in the page table (keys only). This
+-- does NOT load the page blobs, so callers that only need the id set (e.g.
+-- 'recalculateBestAllStream' via 'cpsKeys') don't pull the whole page store
+-- into memory just to extract keys.
+allPageKeys :: SqlBackend db => PageStore db -> IO [Int]
+allPageKeys ps = do
+  rows <- queryDb (psDb ps) ("SELECT key FROM " <> psTable ps) []
+  pure [ sqlToInt k | [k] <- rows ]
+
 -- | Table used for the lazily paged e-class store (shared by save/load).
 classStoreTable :: T.Text
 classStoreTable = "cstore_page"
@@ -254,5 +270,5 @@ classStoreHandle ps = EClassPageStore
   , cpsDelete = \eid -> deletePage ps eid
   , cpsFlush  = writeback ps >> pure ()
   , cpsAll    = fmap (map (decode . BL.fromStrict . snd)) (allPages ps)
-  , cpsKeys   = fmap (map fst) (allPages ps)
+  , cpsKeys   = allPageKeys ps
   }
