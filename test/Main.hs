@@ -388,6 +388,66 @@ testLazyRewrite openDb closeDb = TestCase $ do
       flushStore g1
   closeDb db
 
+-- | Out-of-core round trip through eqsat. Saturate a paged graph (which
+-- *merges* classes and writes the merged bodies + canonical mappings through
+-- the write-through store), save it (paged save writes meta only), then reload
+-- and check the saturated graph -- including the merge and its canonical
+-- mapping -- is reconstructed from the live write-through tables + pages.
+--
+-- This is the correctness guard for P2.2: with a bounded resident cache the
+-- page store is the only authoritative copy of merged class bodies and the
+-- `eclass.canonical` write-through is the only record of merges, so a reload
+-- must see them.
+testPagedEqSatReload :: SqlBackend db => IO db -> (db -> IO ()) -> Test
+testPagedEqSatReload openDb closeDb = TestCase $ do
+  db <- openDb
+  -- x0**2 and x0*x0 are distinct classes; the default rewrite x*x -> x**2
+  -- merges them during eqsat.
+  let ((eidP, eidXx, eidAdd), eg) = runIn emptyGraph $ do
+        _        <- fromTree myCost (var 0)
+        eidP     <- fromTree myCost (var 0 ** 2)
+        eidXx    <- fromTree myCost (var 0 * var 0)
+        eidAdd   <- fromTree myCost (var 0 + var 1)
+        insertFitness eidAdd 0.9 []
+        pure (eidP, eidXx, eidAdd)
+  _ <- saveGraphTest db eg
+  obj <- loadGraphLazy db 1
+  case obj of
+    Left err -> assertFailure ("loadGraphLazy failed: " <> err)
+    Right eg0 -> do
+      -- saturate; x0*x0 should merge into x0**2
+      (_, g1) <- runIOIn eg0 (runEqSat myCost rewrites 30)
+      (cXx, _) <- runIOIn g1 (canonical eidXx)
+      (cP,  _) <- runIOIn g1 (canonical eidP)
+      assertEqual "eqsat merged x0*x0 into x0**2" cP cXx
+      (ksAfter, _) <- runIOIn g1 allKeys
+      let nAfter = length ksAfter
+      -- persist: paged save writes meta only; write-through keeps pages and
+      -- the canonical/node tables live.
+      flushStore g1
+      _ <- saveGraphTest db g1
+      -- reload a fresh lazy graph
+      obj2 <- loadGraphLazy db 1
+      case obj2 of
+        Left err2 -> assertFailure ("reload failed: " <> err2)
+        Right eg2 -> do
+          assertEqual "reload: resident cache empty" 0 (IntMap.size (_eClass eg2))
+          -- same number of classes: the merge persisted (the absorbed class's
+          -- page was deleted, its nodes/canonical remain queryable)
+          (ksReload, _) <- runIOIn eg2 allKeys
+          assertEqual "class count persists across reload" nAfter (length ksReload)
+          -- the merged canonical mapping persists (resolves with no CANON_MISSING)
+          (cXx2, _) <- runIOIn eg2 (canonical eidXx)
+          (cP2,  _) <- runIOIn eg2 (canonical eidP)
+          assertEqual "merged canonical persists" cXx2 cP2
+          -- the surviving (merged) class still matches its expression shape
+          (m, _) <- runIOIn eg2 (match (Fixed (Bin Power (VarPat 'A') (VarPat 'B'))))
+          assertBool "x**y matchable after reload" (not (null m))
+          -- fitness persisted via the page blob / dataset_fit
+          (f, _) <- runIOIn eg2 (getFitness eidAdd)
+          assertEqual "fitness persists" (Just 0.9) f
+  closeDb db
+
 runPagedSuite :: SqlBackend db => String -> (IO db, db -> IO ()) -> [Test]
 runPagedSuite tag (openDb, closeDb) =
   [ TestLabel (tag <> " paged-roundtrip")   (testPagedRoundtrip openDb closeDb)
@@ -395,6 +455,7 @@ runPagedSuite tag (openDb, closeDb) =
   , TestLabel (tag <> " paged-fallback")    (testPagedFallback openDb closeDb)
   , TestLabel (tag <> " lazy-load")         (testLazyLoad openDb closeDb)
   , TestLabel (tag <> " lazy-rewrite")      (testLazyRewrite openDb closeDb)
+  , TestLabel (tag <> " paged-eqsat-reload") (testPagedEqSatReload openDb closeDb)
   ]
 
 runSuite :: SqlBackend db => String -> (IO db, db -> IO ()) -> [Test]
