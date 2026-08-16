@@ -5,16 +5,15 @@
 -- | Out-of-core seed import: build an srtree e-graph directly in the database
 -- by streaming a list of expressions into the relational schema.
 --
--- The import inserts structure only (content-addressed hash-consing): every
--- subexpression is expanded into its own e-class, exactly as the in-memory
--- 'fromTree' does, but identical e-nodes merge via the content-addressable
--- @enode_key@ instead of an in-RAM @nodeToEClass@ map of full class bodies.
--- No class bodies, cost/best data or derived range DBs are ever built, so peak
--- memory stays proportional to the *skeleton* (one node + parent edges per
--- class) rather than the multi-GB fully-materialized graph.
+-- The import holds **no** graph-size data in RAM: e-nodes are content-addressed
+-- against the @enode@/@eclass_node@ tables (the @enode_key@ is their content
+-- address), child lookups for n-ary flattening read each child's node from the
+-- DB, and parent edges are written straight to the @parent@ table. Only a
+-- scalar next-id counter is kept in memory, so peak memory is bounded (one
+-- e-class at a time) regardless of how many expressions are imported.
 --
--- Class pages (@cstore_page@) are written only at the end in a single linear
--- pass, so hot classes (e.g. a variable referenced by every expression) are
+-- Class pages (@cstore_page@) are written at the end in a single linear pass by
+-- reconstructing each class from the relational tables, so hot classes are
 -- never rewritten repeatedly.
 --
 -- The produced database is byte-compatible with 'saveGraph': the same page
@@ -29,11 +28,10 @@ module Algorithm.EqSat.Storage.Import
 import Control.Monad (forM, forM_)
 import Control.Exception (SomeException, catch, displayException, try)
 import Data.IORef (IORef, newIORef, readIORef, modifyIORef', writeIORef)
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, fromMaybe)
 import qualified Data.Text as T
 
 import qualified Data.IntMap as IntMap
-import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashSet as HashSet
 
 import Data.Binary (encode)
@@ -45,9 +43,10 @@ import Data.SRTree.Eval (Target)
 import Algorithm.EqSat.Egraph
   ( EClassId, ENode(..), NOp(..), EClass(..), EClassData(..), Consts(..) )
 import Algorithm.EqSat.Storage.Backend
-  ( SqlValue(..), SqlBackend(..) )
+  ( SqlValue(..), SqlBackend(..), sqlToInt, sqlToMaybeDouble, sqlToText )
 import Algorithm.EqSat.Storage.ClassStore (classStoreTable, hex)
-import Algorithm.EqSat.Storage.Types (enodeKey, enodeOpTag, enodeOpDetail, serializeTheta)
+import Algorithm.EqSat.Storage.Types
+  ( enodeKey, enodeOpTag, enodeOpDetail, serializeTheta, parseTheta, parseEnodeKey )
 import Algorithm.EqSat.Storage.Schema (createSchema)
 
 -- | Result of an out-of-core import.
@@ -57,31 +56,30 @@ data ImportSummary = ImportSummary
   , isExpressions :: !Int -- ^ root expressions inserted
   } deriving (Show, Eq)
 
--- | In-process import state: the class skeleton (content key -> id, id -> node
--- and height) plus the accumulated reverse-parent edges.
+-- | The only in-process state: the next free e-class id (a single scalar, so
+-- import memory is independent of the number of classes).
 data ImportState = ImportState
   { stNextId :: !Int
-  , stByKey  :: !(HashMap.HashMap String EClassId)
-  , stClass  :: !(HashMap.HashMap EClassId (ENode, Int, Maybe Double))
-  , stParents :: !(HashMap.HashMap EClassId (HashSet.HashSet (EClassId, ENode)))
   }
 
 -- | Insert a list of @(expression, theta, fitness)@ into the database,
 -- structurally expanding every subexpression into its own e-class, then write
--- the class pages in a final linear pass. Runs inside transactions (rolled
--- back on error).
+-- the class pages in a final linear pass. Runs inside a single transaction
+-- (rolled back on error).
 importEqs :: SqlBackend db => db -> [(Fix SRTree, [Target], Maybe Double)] -> IO (Either String ImportSummary)
 importEqs db eqs = do
   createSchema db
-  ref <- newIORef (ImportState 0 HashMap.empty HashMap.empty HashMap.empty)
+  -- content-address dedup queries by enode_key, but eclass_node's PK is
+  -- (eid, enode_key); index enode_key so those lookups are O(log n) not a scan.
+  execDb db "CREATE INDEX IF NOT EXISTS idx_eclass_node_enode_key ON eclass_node(enode_key)"
+  ref <- newIORef (ImportState 0)
   r <- try $ do
     execDb db "BEGIN"
     forM_ eqs $ \(t, theta, fit) -> do
       (eid, h) <- insertTree ref db fit t
-      -- the root's params/theta are only meaningful at the root; overwrite the
-      -- fit row written during insertion (which used empty theta).
       insertFit db eid theta fit h
     writeMeta db ref
+    writeAllPages db
     execDb db "COMMIT"
   case r of
     Left (e :: SomeException) -> do
@@ -89,23 +87,7 @@ importEqs db eqs = do
       pure (Left ("importEqs failed: " <> displayException e))
     Right () -> do
       st <- readIORef ref
-      rp <- try (writeAllPages db st)
-      case rp of
-        Left (e :: SomeException) ->
-          pure (Left ("importEqs (pages) failed: " <> displayException e))
-        Right () ->
-          pure (Right (ImportSummary (stNextId st) (stNextId st) (length eqs)))
-
--- | Write every class page once, from the in-memory skeleton.
-writeAllPages :: SqlBackend db => db -> ImportState -> IO ()
-writeAllPages db st = do
-  execDb db "BEGIN"
-  mapM_ (uncurry (writeClassPage db))
-    [ (eid, EClass eid (HashSet.singleton en)
-           (HashMap.lookupDefault HashSet.empty eid (stParents st))
-           h (defaultInfo en h fit))
-    | (eid, (en, h, fit)) <- HashMap.toList (stClass st) ]
-  execDb db "COMMIT"
+      pure (Right (ImportSummary (stNextId st) (stNextId st) (length eqs)))
 
 -- | Insert a full tree bottom-up, returning its root e-class id and height.
 insertTree :: SqlBackend db => IORef ImportState -> db -> Maybe Double -> Fix SRTree -> IO (EClassId, Int)
@@ -114,66 +96,70 @@ insertTree ref db fit t = case unfix t of
   Param ix   -> insertNode ref db fit (EParam ix) []
   Const x    -> insertNode ref db fit (EConst x) []
   Uni f sub  -> do
-    (c, _) <- insertTree ref db fit sub
-    insertNode ref db fit (EUni f c) [(c, 1)]
+    (c, ch) <- insertTree ref db fit sub
+    insertNode ref db fit (EUni f c) [(c, 1, ch)]
   Bin Add l r -> insertNAry ref db fit EAdd l r
   Bin Mul l r -> insertNAry ref db fit EMul l r
   Bin op l r  -> do
-    (lc, _) <- insertTree ref db fit l
-    (rc, _) <- insertTree ref db fit r
-    insertNode ref db fit (EBin op lc rc) [(lc, 1), (rc, 1)]
+    (lc, lh) <- insertTree ref db fit l
+    (rc, rh) <- insertTree ref db fit r
+    insertNode ref db fit (EBin op lc rc) [(lc, 1, lh), (rc, 1, rh)]
 
 -- | Insert a flattened n-ary node (@Add@/@Mul@), merging nested same-op chains
 -- the same way 'mkENaryM' does (a child whose class holds a single same-op
--- ENAry is flattened in).
+-- ENAry is flattened in). Children and their heights are read from the DB.
 insertNAry :: SqlBackend db => IORef ImportState -> db -> Maybe Double -> NOp -> Fix SRTree -> Fix SRTree -> IO (EClassId, Int)
 insertNAry ref db fit op l r = do
   (c1, _) <- insertTree ref db fit l
   (c2, _) <- insertTree ref db fit r
-  flat <- flattenChildren ref op [(c1, 1), (c2, 1)]
-  insertNode ref db fit (ENAry op flat) (IntMap.toList flat)
+  flat <- flattenChildren db op [(c1, 1), (c2, 1)]
+  childsH <- forM (IntMap.toList flat) $ \(c, n) -> do
+    h <- classHeight db c
+    pure (c, n, h)
+  insertNode ref db fit (ENAry op flat) childsH
 
 -- | Flatten @n@ occurrences of @cid@ when its class holds exactly one ENAry of
--- the same op (scaled by @n@); otherwise keep @cid@.
-flattenChildren :: IORef ImportState -> NOp -> [(EClassId, Int)] -> IO (IntMap.IntMap Int)
-flattenChildren ref op children = do
-  st <- readIORef ref
-  let ms = [ case HashMap.lookup c (stClass st) of
-               Just (ENAry op' m', _, _) | op' == op -> IntMap.map (* n) m'
-               _                                     -> IntMap.singleton c n
-           | (c, n) <- children ]
+-- the same op (scaled by @n@); otherwise keep @cid@. Each child's node is read
+-- from the database (no in-memory class index).
+flattenChildren :: SqlBackend db => db -> NOp -> [(EClassId, Int)] -> IO (IntMap.IntMap Int)
+flattenChildren db op children = do
+  ms <- forM children $ \(c, n) -> do
+    men <- lookupClassNode db c
+    case men of
+      Just (ENAry op' m') | op' == op -> pure (IntMap.map (* n) m')
+      _                               -> pure (IntMap.singleton c n)
   pure (IntMap.unionsWith (+) ms)
 
 -- | Content-addressed insert of a single e-node. Returns the e-class id and
 -- height of the node (reusing the existing class when already present).
-insertNode :: SqlBackend db => IORef ImportState -> db -> Maybe Double -> ENode -> [(EClassId, Int)] -> IO (EClassId, Int)
+insertNode :: SqlBackend db => IORef ImportState -> db -> Maybe Double -> ENode -> [(EClassId, Int, Int)] -> IO (EClassId, Int)
 insertNode ref db fit en children = do
   let key   = enodeKey en
-      childs = IntMap.toList (IntMap.fromListWith (+) children)
-  st <- readIORef ref
-  case HashMap.lookup key (stByKey st) of
+      childs = dedupChildren children
+  mEid <- lookupEnodeId db key
+  case mEid of
     Just eid -> do
-      let (_, h, _) = HashMap.lookupDefault (en, 0, Nothing) eid (stClass st)
+      h <- classHeight db eid
       pure (eid, h)
     Nothing -> do
-      let eid    = stNextId st
-          h      = 1 + maximum (0 : [ maybe 0 (\(_, h, _) -> h) (HashMap.lookup c (stClass st)) | (c, _) <- childs ])
-          st1    = st { stNextId = eid + 1
-                      , stByKey  = HashMap.insert key eid (stByKey st)
-                      , stClass  = HashMap.insert eid (en, h, fit) (stClass st)
-                      , stParents = HashMap.unionWith HashSet.union
-                          (stParents st)
-                          (HashMap.fromList
-                            [ (c, HashSet.singleton (eid, en)) | (c, _) <- childs ])
-                      }
-      writeIORef ref st1
+      st <- readIORef ref
+      let eid = stNextId st
+          h   = 1 + maximum (0 : [ ch | (_, _, ch) <- childs ])
+      writeIORef ref (st { stNextId = eid + 1 })
       writeNode db eid en key childs h fit
       pure (eid, h)
 
--- | Write the relational rows for a brand-new e-node. Reverse parent edges are
--- recorded on the children's accumulated parent sets in memory (their pages are
--- written later, once, by 'writeAllPages').
-writeNode :: SqlBackend db => db -> EClassId -> ENode -> String -> [(EClassId, Int)] -> Int -> Maybe Double -> IO ()
+-- | Merge duplicate child e-classes into multiplicities (e.g. @x0 - x0@ has
+-- both children in the same class), keeping the max height.
+dedupChildren :: [(EClassId, Int, Int)] -> [(EClassId, Int, Int)]
+dedupChildren =
+  map (\(c, (n, h)) -> (c, n, h)) . IntMap.toList
+  . IntMap.fromListWith (\(n1, h1) (n2, h2) -> (n1 + n2, max h1 h2))
+  . map (\(c, n, h) -> (c, (n, h)))
+
+-- | Write the relational rows for a brand-new e-node. Reverse parent edges go
+-- straight to the @parent@ table (reconstructed into pages by 'writeAllPages').
+writeNode :: SqlBackend db => db -> EClassId -> ENode -> String -> [(EClassId, Int, Int)] -> Int -> Maybe Double -> IO ()
 writeNode db eid en key children h fit = do
   runDb db "INSERT INTO enode (key, op, op_detail) VALUES (?, ?, ?)"
     [ SqlText (T.pack key)
@@ -192,7 +178,7 @@ writeNode db eid en key children h fit = do
       [ SqlText (T.pack key)
       , SqlInteger (fromIntegral c)
       , SqlInteger (fromIntegral n) ]
-  forM_ children $ \(c, _) ->
+  forM_ children $ \(c, _, _) ->
     runDb db "INSERT INTO parent (child_eid, parent_eid, parent_enode_key) VALUES (?, ?, ?)"
       [ SqlInteger (fromIntegral c)
       , SqlInteger (fromIntegral eid)
@@ -207,6 +193,67 @@ naryChildrenOf :: ENode -> [(EClassId, Int)]
 naryChildrenOf (ENAry _ m) = IntMap.toList m
 naryChildrenOf _           = []
 
+-- | Look up an existing e-class id for a content key (NULL if absent).
+lookupEnodeId :: SqlBackend db => db -> String -> IO (Maybe EClassId)
+lookupEnodeId db key = do
+  rows <- queryDb db "SELECT eid FROM eclass_node WHERE enode_key = ?"
+                    [SqlText (T.pack key)]
+  pure $ case rows of
+    ([eid] : _) -> Just (sqlToInt eid)
+    _           -> Nothing
+
+-- | Height of an e-class (from the @eclass@ row).
+classHeight :: SqlBackend db => db -> EClassId -> IO Int
+classHeight db eid = do
+  rows <- queryDb db "SELECT height FROM eclass WHERE eid = ?"
+                    [SqlInteger (fromIntegral eid)]
+  pure $ case rows of
+    ([h] : _) -> sqlToInt h
+    _         -> 0
+
+-- | The singleton e-node of a class (NULL if the class has no node row yet).
+lookupClassNode :: SqlBackend db => db -> EClassId -> IO (Maybe ENode)
+lookupClassNode db eid = do
+  rows <- queryDb db "SELECT enode_key FROM eclass_node WHERE eid = ?"
+                    [SqlInteger (fromIntegral eid)]
+  pure $ case rows of
+    ([SqlText k] : _) -> parseEnodeKey (T.unpack k)
+    _                 -> Nothing
+
+-- | Write every class page once, reconstructing each class from the relational
+-- tables (node + height from @eclass_node@/@eclass@, parents from @parent@,
+-- metrics from @fit@). Memory stays bounded to a single class at a time.
+writeAllPages :: SqlBackend db => db -> IO ()
+writeAllPages db = do
+  cids <- queryDb db "SELECT eid FROM eclass ORDER BY eid" []
+  forM_ cids $ \[eidCol] -> do
+    let eid = sqlToInt eidCol
+    nh <- queryDb db
+      "SELECT n.enode_key, c.height FROM eclass_node n \
+      \JOIN eclass c ON c.eid = n.eid WHERE n.eid = ?"
+      [SqlInteger (fromIntegral eid)]
+    case nh of
+      ([SqlText k, hcol] : _) -> do
+        let en = fromMaybe (error ("importEqs: bad node key for eid " <> show eid))
+                           (parseEnodeKey (T.unpack k))
+            h  = sqlToInt hcol
+        pr <- queryDb db "SELECT parent_eid, parent_enode_key FROM parent WHERE child_eid = ?"
+                         [SqlInteger (fromIntegral eid)]
+        let parents = HashSet.fromList
+              [ (sqlToInt pe, fromMaybe (error "importEqs: bad parent key") (parseEnodeKey (T.unpack (sqlToText pk))))
+              | [pe, pk] <- pr ]
+        fit <- queryDb db "SELECT fitness, dl, theta, size FROM fit WHERE eid = ?"
+                        [SqlInteger (fromIntegral eid)]
+        let (f, dl, theta, sz) = case fit of
+              ([fcol, dlcol, tcol, scol] : _) ->
+                ( sqlToMaybeDouble fcol
+                , sqlToMaybeDouble dlcol
+                , parseTheta (T.unpack (sqlToText tcol))
+                , sqlToInt scol )
+              _ -> (Nothing, Nothing, [], 0)
+        writeClassPage db eid (EClass eid (HashSet.singleton en) parents h (defaultInfo en f dl theta sz))
+      _ -> pure ()
+
 -- | Serialize an e-class to the page store (INSERT OR REPLACE so the final
 -- pass is idempotent).
 writeClassPage :: SqlBackend db => db -> EClassId -> EClass -> IO ()
@@ -216,13 +263,11 @@ writeClassPage db eid ec =
     , SqlText (hex (BL.toStrict (encode ec))) ]
 
 -- | Per-class data. Cost/best are derived quantities recomputed on load
--- ('recalculateBestAll'). Fitness is baked into the page (so out-of-core reads
--- via the paged store see it); dl/theta/size are left to the @fit@ table.
--- @_consts@ is set from the node so constant-folding rules behave identically
--- to the in-memory seed (a class holding a literal constant must report it, or
--- 'foldConsts' creates spurious classes during eqsat).
-defaultInfo :: ENode -> Int -> Maybe Double -> EClassData
-defaultInfo en h fit = EData 0 en (constOf en) fit Nothing [] h
+-- ('recalculateBestAll'). Fitness/dl/theta/size are baked into the page (so
+-- out-of-core reads via the paged store see them). @_consts@ is set from the
+-- node so constant-folding rules behave identically to the in-memory seed.
+defaultInfo :: ENode -> Maybe Double -> Maybe Double -> [Target] -> Int -> EClassData
+defaultInfo en f dl theta sz = EData 0 en (constOf en) f dl theta sz
 
 constOf :: ENode -> Consts
 constOf (EConst x)   = ConstVal x
