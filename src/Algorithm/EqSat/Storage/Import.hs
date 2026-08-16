@@ -83,7 +83,6 @@ importEqs db ds eqs = do
     -- the whole parsed expression list in memory.
     n <- foldM (\c (t, theta, fit) -> do
                    (eid, h) <- insertTree ref db fit dsid t
-                   insertFit db eid theta fit h
                    writeDatasetFit db dsid eid fit Nothing (T.pack (serializeTheta theta)) h
                    -- record the root expression in the registry (keyed by its
                    -- canonical root node) so "was this expression seen/tested?"
@@ -202,10 +201,8 @@ writeNode db eid en key children h fit dsid = do
       [ SqlInteger (fromIntegral c)
       , SqlInteger (fromIntegral eid)
       , SqlText (T.pack key) ]
-  -- every class gets a fit row (legacy) and a dataset_fit row so the graph is
-  -- fitness-annotated per dataset; the root's proper params/theta are written
-  -- by the caller.
-  insertFit db eid [] fit h
+  -- every class gets a dataset_fit row so the graph is fitness-annotated per
+  -- dataset; the root's proper params/theta are written by the caller.
   writeDatasetFit db dsid eid fit Nothing "" h
 
 -- | ENAry children as (class, multiplicity); empty for all other node shapes
@@ -288,19 +285,6 @@ constOf :: ENode -> Consts
 constOf (EConst x)   = ConstVal x
 constOf (EParam ix)  = ParamIx ix
 constOf _            = NotConst
-
--- | Write a @fit@ row for a root e-class. NULL fitness is stored as literal NULL.
-insertFit :: SqlBackend db => db -> EClassId -> [Target] -> Maybe Double -> Int -> IO ()
-insertFit db eid theta fit sz = do
-  let (fitCol, fitVal) = case fit of
-        Nothing -> ("NULL", Nothing)
-        Just f  -> ("?", Just (SqlFloat f))
-  runDb db ("INSERT OR REPLACE INTO fit (eid, fitness, dl, theta, size) VALUES (?, "
-             <> fitCol <> ", NULL, ?, ?)")
-    (catMaybes [ Just (SqlInteger (fromIntegral eid))
-               , fitVal
-               , Just (SqlText (T.pack (serializeTheta theta)))
-               , Just (SqlInteger (fromIntegral sz)) ])
 
 -- | Write the @meta@ scalars: next free id and DB-tracking flag (mirrors the
 -- in-memory seed graph, which runs with range-DB tracking enabled).

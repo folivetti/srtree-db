@@ -32,7 +32,7 @@ import Algorithm.EqSat.Build (fromTree)
 import Algorithm.EqSat.Info (insertFitness)
 import Algorithm.EqSat.DB (Pattern(..), match)
 import Algorithm.EqSat.Queries (findRootClasses)
-import Algorithm.EqSat.Storage.Backend ( SqlValue(..), SqlBackend(..) )
+import Algorithm.EqSat.Storage.Backend ( SqlValue(..), SqlBackend(..), sqlToInt )
 import Algorithm.EqSat.Storage.ClassStore
 import Algorithm.EqSat.Storage.SQLite
 import Algorithm.EqSat.Storage.Query (getOrCreateDataset)
@@ -152,10 +152,9 @@ testSync openDb closeDb = TestCase $ do
   assertEqual "pushed fitness read back" (Just 0.99) (evalIn eg3 (getFitness eidAdd))
   assertEqual "graph class count intact" (IntMap.size (_eClass eg)) (IntMap.size (_eClass eg3))
 
-  -- edit fitness straight in the DB, refresh pulls it in. refreshFitness reads
-  -- dataset_fit; the legacy loadGraph reads fit (kept for the test loader).
+  -- edit fitness straight in the DB, refresh pulls it in; refreshFitness and
+  -- loadGraph both read dataset_fit now (the legacy fit table is gone).
   execDb db ("UPDATE dataset_fit SET fitness = 0.55 WHERE eid = " <> T.pack (show eidAdd))
-  execDb db ("UPDATE fit SET fitness = 0.55 WHERE eid = " <> T.pack (show eidAdd))
   Right eg4 <- refreshFitness db 1 eg
   assertEqual "db edit pulled in" (Just 0.55) (evalIn eg4 (getFitness eidAdd))
 
@@ -425,6 +424,10 @@ testPagedEqSatReload openDb closeDb = TestCase $ do
       -- persist: paged save writes meta only; write-through keeps pages and
       -- the canonical/node tables live.
       flushStore g1
+      -- enode_child is populated for the nodes created during eqsat
+      ecRows <- query db "SELECT COUNT(*) FROM enode_child" []
+      assertBool "enode_child populated during eqsat"
+        (case ecRows of [[v]] -> sqlToInt v > 0; _ -> False)
       _ <- saveGraphTest db g1
       -- reload a fresh lazy graph
       obj2 <- loadGraphLazy db 1

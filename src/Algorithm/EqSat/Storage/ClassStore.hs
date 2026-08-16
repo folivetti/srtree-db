@@ -70,7 +70,7 @@ import Algorithm.EqSat.Storage.Backend
 import Algorithm.EqSat.Storage.Types
   ( enodeKey, enodeOpTag, enodeOpDetail, opDetailOf )
 import Algorithm.EqSat.Egraph
-  ( EClass, EClassPageStore(..), ENode, _eClassId )
+  ( EClass, EClassPageStore(..), ENode(..), _eClassId )
 
 -- ---------------------------------------------------------------------------
 -- hex encoding of page blobs (driver-neutral TEXT storage)
@@ -244,9 +244,10 @@ writeback ps = do
   pure (length pend)
 
 -- | Flush any newly-created nodes recorded via 'cpsRecordNode' into the
--- relational @enode@/@eclass_node@ tables (idempotently), so the streaming
--- matcher's @op_detail@ index reflects the live graph. Runs inside its own
--- transaction (the page write-back above may be a no-op).
+-- relational @enode@/@eclass_node@/@enode_child@ tables (idempotently), so the
+-- streaming matcher's @op_detail@ index and the @enode_child@ children table
+-- reflect the live graph. Runs inside its own transaction (the page write-back
+-- above may be a no-op).
 flushNodes :: SqlBackend db => PageStore db -> IO ()
 flushNodes ps = do
   nodes <- readIORef (psNodes ps)
@@ -261,8 +262,18 @@ flushNodes ps = do
         , SqlText (T.pack (enodeOpDetail en)) ]
       insertIgnore db "eclass_node (eid, enode_key) VALUES (?, ?)"
         [ SqlInteger (fromIntegral eid), SqlText key ]
+      -- ENAry children are stored relationally; keep them populated during eqsat
+      -- too (they were previously written only at import/save).
+      forM_ (naryChildren en) $ \(c, n) ->
+        insertIgnore db "enode_child (enode_key, child_eid, cnt) VALUES (?, ?, ?)"
+          [ SqlText key, SqlInteger (fromIntegral c), SqlInteger (fromIntegral n) ]
     execDb db "COMMIT"
     modifyIORef' (psNodes ps) (const Set.empty)
+
+-- | Children of an ENAry node as (class, multiplicity); empty otherwise.
+naryChildren :: ENode -> [(Int, Int)]
+naryChildren (ENAry _ m) = IM.toList m
+naryChildren _           = []
 
 -- | Flush any pending canonical rows (recorded via 'cpsRecordCanonical') into
 -- @eclass.canonical@ (idempotent upsert), so the streaming canonical lookup

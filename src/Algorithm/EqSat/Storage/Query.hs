@@ -10,6 +10,7 @@
 module Algorithm.EqSat.Storage.Query
   ( getOrCreateDataset
   , datasetId
+  , firstDatasetId
   , writeDatasetFit
   , readDatasetFit
   , topN
@@ -48,6 +49,15 @@ getOrCreateDataset db name = do
 datasetId :: SqlBackend db => db -> String -> IO (Maybe Int)
 datasetId db name = do
   rows <- queryDb db "SELECT id FROM dataset WHERE name = ?" [SqlText (T.pack name)]
+  pure $ case rows of
+    ([i] : _) -> Just (sqlToInt i)
+    _         -> Nothing
+
+-- | The id of the first dataset (used by the legacy 'loadGraph' path, which is
+-- not dataset-scoped, to source per-class risk metrics from @dataset_fit@).
+firstDatasetId :: SqlBackend db => db -> IO (Maybe Int)
+firstDatasetId db = do
+  rows <- queryDb db "SELECT id FROM dataset ORDER BY id LIMIT 1" []
   pure $ case rows of
     ([i] : _) -> Just (sqlToInt i)
     _         -> Nothing

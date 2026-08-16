@@ -62,7 +62,7 @@ import Algorithm.EqSat.Storage.Backend
   ( SqlValue(..), SqlBackend(..), sqlToInt, sqlToMaybeDouble, sqlToText )
 import Algorithm.EqSat.Storage.ClassStore
   ( classStoreTable, openClassStore, allPages, classStoreHandle, hex, unhex )
-import Algorithm.EqSat.Storage.Query (readDatasetFit, writeDatasetFit)
+import Algorithm.EqSat.Storage.Query (readDatasetFit, writeDatasetFit, firstDatasetId)
 import Algorithm.EqSat.Storage.Stream (streamRootsByOp)
 import Algorithm.EqSat.Storage.Types
 import Algorithm.EqSat.Storage.Schema (createSchema, schemaSQL)
@@ -171,7 +171,6 @@ saveGraph db dsid eg = do
         writeNodes db rows
         writeClasses db rows
         writeParents db rows
-        writeFit db rows
         writeDatasetFitRows db dsid rows
         writeClassPages db rows
   where
@@ -211,7 +210,6 @@ clearTables db = do
   execDb db "DELETE FROM eclass_node"
   execDb db "DELETE FROM enode"
   execDb db "DELETE FROM eclass"
-  execDb db "DELETE FROM fit"
   execDb db ("DELETE FROM " <> classStoreTable)
 
 -- | Serialize and store every canonical e-class as a page in the page store
@@ -271,31 +269,6 @@ writeParents db rows =
         , SqlInteger (fromIntegral pEid)
         , SqlText (T.pack (enodeKey pEn)) ]
 
--- | Insert a @fit@ row. NULL fitness/DL are expressed as literal @NULL@ (the
--- shared SQL is therefore driver-neutral).
--- | Write the legacy @fit@ rows (kept for the non-dataset 'loadGraph' test
--- loader; the dataset-aware path uses 'writeDatasetFitRows').
-writeFit :: SqlBackend db => db -> GraphRows -> IO ()
-writeFit db rows =
-  forM_ (IntMap.toAscList (_grEClasses rows)) $ \(eid, r) -> do
-    let info = _rcInfo r
-        fit  = _fitness info
-        dl   = _dl info
-        sz   = _size info
-        (fitCol, fitVal) = case fit of
-                             Nothing -> ("NULL", Nothing)
-                             Just f  -> ("?", Just (SqlFloat f))
-        (dlCol, dlVal)   = case dl of
-                             Nothing -> ("NULL", Nothing)
-                             Just d  -> ("?", Just (SqlFloat d))
-    run db ("INSERT INTO fit (eid, fitness, dl, theta, size) VALUES (?, "
-              <> fitCol <> ", " <> dlCol <> ", ?, ?)")
-      (catMaybes [ Just (SqlInteger (fromIntegral eid))
-                 , fitVal
-                 , dlVal
-                 , Just (SqlText (T.pack (serializeTheta (_theta info))))
-                 , Just (SqlInteger (fromIntegral sz)) ])
-
 -- | Write the per-(dataset, e-class) fitness rows for every class in a graph.
 writeDatasetFitRows :: SqlBackend db => db -> Int -> GraphRows -> IO ()
 writeDatasetFitRows db dsid rows =
@@ -323,7 +296,15 @@ loadGraph db = do
     Just (nextId, trackDBs) -> do
       enodes <- readNodes db
       ecLst  <- readClasses db
-      fit    <- readFit db
+      -- risk metrics come from @dataset_fit@ (the legacy @fit@ table is gone);
+      -- the legacy non-dataset loader uses the first dataset's values.
+      mdsid <- firstDatasetId db
+      fit    <- case mdsid of
+                  Nothing -> pure []
+                  Just ds -> do
+                    rows <- readDatasetFit db ds
+                    pure [ (eid, (f, d, sz, parseTheta (T.unpack th)))
+                         | (eid, (f, d, sz, th)) <- rows ]
       let canon     = IntMap.fromList [ (eid, c) | (eid, c, _) <- ecLst ]
           nodeToEClass = HashMap.fromList enodes
       ps <- openClassStore db defaultClassCap 1000
@@ -533,17 +514,6 @@ readParents db = do
         en <- parseEnodeKey (T.unpack (sqlToText k))
         pure (sqlToInt c, sqlToInt p, en)
     | [c, p, k] <- rows ])
-
--- | Read (eid, fitness, dl, size, theta) rows.
-readFit :: SqlBackend db => db -> IO [(EClassId, (Maybe Double, Maybe Double, Int, [Target]))]
-readFit db = do
-  rows <- query db "SELECT eid, fitness, dl, size, theta FROM fit" []
-  pure [ ( sqlToInt eid
-         , ( sqlToMaybeDouble f
-           , sqlToMaybeDouble d
-           , sqlToInt s
-           , parseTheta (T.unpack (sqlToText t)) ) )
-       | [eid, f, d, s, t] <- rows ]
 
 -- | Rebuild @_grEClasses@ rows: only canonical roots carry real class rows.
 -- Parent pointers come from the stored @parent@ relation when present, falling
