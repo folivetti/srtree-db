@@ -378,27 +378,18 @@ seedEDB nextId trackDBs nodeToEClass fitMap =
                                  , _sizeDLDB = IntMap.insertWith RangeSet.union sz (RangeSet.singleton (dn, eid)) (_sizeDLDB db2) }
       in db3
 
--- | Minimal DB seed for the lazily paged path: the pattern trie plus base
--- scalars (next id, tracking), but NO size/fitness/DL range DBs. The out-of-core
--- eqsat only reads '_patDB' (the matcher) and the work/analysis/unevaluated
--- sets; the range DBs are in-memory query structures that would otherwise waste
--- O(#classes) memory on every loadGraphLazy.
+-- | Minimal DB seed for the lazily paged path: the base scalars (next id,
+-- tracking) with NO pattern trie and NO size/fitness/DL range DBs. The
+-- out-of-core eqsat streams both matcher paths ('matchStreamCached' and
+-- 'matchNAryWith') directly from the backing store via 'streamRoots', so the
+-- O(nodes) in-RAM @_patDB@ trie is not built at all here. ('_nodeToEClass' is
+-- kept only to populate the EGraph's node->class map.)
 seedEDBPaged
   :: Int -> Bool
   -> HashMap.HashMap ENode EClassId
   -> EGraphDB
-seedEDBPaged nextId trackDBs nodeToEClass =
-  HashMap.foldlWithKey' addNode trie0 nodeToEClass
-  where
-    trie0 :: EGraphDB
-    trie0 = (emptyDB){ _nextId = nextId, _trackDBs = trackDBs }
-    addNode db en eid =
-      let ids = eid : eChildren en
-          op  = eOpKey en
-          cur = Map.lookup op (_patDB db)
-      in case populate cur ids of
-           Nothing -> db
-           Just t  -> db { _patDB = Map.insert op t (_patDB db) }
+seedEDBPaged nextId trackDBs _nodeToEClass =
+  (emptyDB){ _nextId = nextId, _trackDBs = trackDBs }
 
 -- | Reconstruct an e-graph for out-of-core use: like 'loadGraph' but the
 -- resident e-class map is left empty and an 'EClassPageStore' handle is
