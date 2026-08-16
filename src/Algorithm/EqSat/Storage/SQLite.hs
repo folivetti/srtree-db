@@ -61,7 +61,7 @@ import Algorithm.EqSat.Store
 import Algorithm.EqSat.Storage.Backend
   ( SqlValue(..), SqlBackend(..), sqlToInt, sqlToMaybeDouble, sqlToText )
 import Algorithm.EqSat.Storage.ClassStore
-  ( classStoreTable, openClassStore, allPages, classStoreHandle, hex )
+  ( classStoreTable, openClassStore, allPages, classStoreHandle, hex, unhex )
 import Algorithm.EqSat.Storage.Query (readDatasetFit, writeDatasetFit)
 import Algorithm.EqSat.Storage.Stream (streamRootsByOp)
 import Algorithm.EqSat.Storage.Types
@@ -100,6 +100,21 @@ instance SqlBackend Database where
   -- after @budget@ rows, so the matcher never materializes the whole (operator
   -- -> root set) index in RAM.
   streamByOp db opDetail budget exclude = streamRootsByOp db opDetail budget exclude
+  -- Stream every page of a key-value table through a cursor, so a full pass
+  -- (e.g. pushFit) stays O(1) memory instead of materializing all pages.
+  streamPages db tbl k = withStatement db ("SELECT key, blob FROM " <> tbl) $ \stmt -> do
+    go stmt
+    where
+      go stmt = do
+        r <- step stmt
+        case r of
+          Done -> pure ()
+          Row  -> do
+            cols <- columns stmt
+            let eid = case cols of (SQLInteger i : _) -> i; _ -> 0
+                hv  = case cols of (_ : SQLText t : _) -> t; _ -> ""
+            k eid (unhex hv)
+            go stmt
   createSchemaDb db = mapM_ (exec db) schemaSQL
 
 toSqlData :: SqlValue -> SQLData
@@ -571,14 +586,27 @@ buildClasses canon nodeToEClass storedParents fit heights =
     headOrDefault _   (x:_) = x
 
 -- | Push the graph's risk metrics into the @dataset_fit@ table for a dataset
--- (leaves structure intact).
+-- (leaves structure intact). On a paged graph the classes are streamed page by
+-- page (O(1) memory) rather than materialized via 'cpsAll'.
 pushFit :: SqlBackend db => db -> Int -> EGraph -> IO ()
 pushFit db dsid eg = do
   createSchema db
-  let rows0 = exportEGraph eg
-  gr <- graphClassRows eg
   run db "DELETE FROM dataset_fit WHERE dataset_id = ?" [SqlInteger (fromIntegral dsid)]
-  writeDatasetFitRows db dsid (rows0 { _grEClasses = gr })
+  case _classStore eg of
+    Nothing -> do
+      let rows0 = exportEGraph eg
+      writeDatasetFitRows db dsid rows0
+    Just _ -> do
+      -- flush so every dirty page is in @cstore_page@, then stream each class
+      -- and write its row, discarding it (O(1) memory).
+      flushStore eg
+      execDb db "BEGIN"
+      streamPages db classStoreTable $ \_eid blob -> do
+        let ec = decode (BL.fromStrict blob)
+            info = _info ec
+        writeDatasetFit db dsid (_eClassId ec) (_fitness info) (_dl info)
+          (T.pack (serializeTheta (_theta info))) (_size info)
+      execDb db "COMMIT"
 
 -- | Overwrite in-memory fitness/DL with the values currently stored in the
 -- database for a dataset (per e-class, by canonical id).

@@ -448,6 +448,24 @@ testPagedEqSatReload openDb closeDb = TestCase $ do
           assertEqual "fitness persists" (Just 0.9) f
   closeDb db
 
+-- | The paged (streamed) 'pushFit' path: change fitness in a lazy graph, flush,
+-- push to @dataset_fit@, and read it back via 'refreshFitness'.
+testPagedPushFit :: SqlBackend db => IO db -> (db -> IO ()) -> Test
+testPagedPushFit openDb closeDb = TestCase $ do
+  db <- openDb
+  (eg, eidAdd, _, _) <- buildGraph
+  _ <- saveGraphTest db eg
+  obj <- loadGraphLazy db 1
+  case obj of
+    Left err -> assertFailure ("loadGraphLazy failed: " <> err)
+    Right eg0 -> do
+      (_, g1) <- runIOIn eg0 (insertFitness eidAdd 0.99 [])
+      flushStore g1
+      pushFit db 1 g1                      -- streamed (O(1) memory) push
+      Right eg2 <- refreshFitness db 1 eg
+      assertEqual "paged push fitness read back" (Just 0.99) (evalIn eg2 (getFitness eidAdd))
+  closeDb db
+
 runPagedSuite :: SqlBackend db => String -> (IO db, db -> IO ()) -> [Test]
 runPagedSuite tag (openDb, closeDb) =
   [ TestLabel (tag <> " paged-roundtrip")   (testPagedRoundtrip openDb closeDb)
@@ -455,6 +473,7 @@ runPagedSuite tag (openDb, closeDb) =
   , TestLabel (tag <> " paged-fallback")    (testPagedFallback openDb closeDb)
   , TestLabel (tag <> " lazy-load")         (testLazyLoad openDb closeDb)
   , TestLabel (tag <> " lazy-rewrite")      (testLazyRewrite openDb closeDb)
+  , TestLabel (tag <> " paged-push-fit")    (testPagedPushFit openDb closeDb)
   , TestLabel (tag <> " paged-eqsat-reload") (testPagedEqSatReload openDb closeDb)
   ]
 

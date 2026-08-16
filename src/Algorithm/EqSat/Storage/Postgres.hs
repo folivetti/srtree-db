@@ -17,7 +17,7 @@ module Algorithm.EqSat.Storage.Postgres
   , closePostgres
   ) where
 
-import Control.Monad (forM)
+import Control.Monad (forM, forM_)
 import Data.ByteString (ByteString)
 import qualified Data.IntSet as IntSet
 import Data.Text (Text)
@@ -28,7 +28,8 @@ import Database.PostgreSQL.LibPQ
   , connectdb, exec, execParams, finish, getvalue, invalidOid, nfields
   , ntuples, resultErrorMessage, resultStatus, toColumn, toRow )
 
-import Algorithm.EqSat.Storage.Backend (SqlValue(..), SqlBackend(..), sqlToInt)
+import Algorithm.EqSat.Storage.Backend (SqlValue(..), SqlBackend(..), sqlToInt, sqlToText)
+import Algorithm.EqSat.Storage.ClassStore (unhex)
 
 -- | PostgreSQL DDL. Mirrors 'Algorithm.EqSat.Storage.Schema.schemaSQL'.
 --
@@ -157,6 +158,11 @@ instance SqlBackend Connection where
       \JOIN enode e ON e.key = n.enode_key WHERE e.op_detail = ?"
       [SqlText opDetail]
     pure (take budget [ eid | [eid'] <- rows, let eid = sqlToInt eid', not (IntSet.member eid ex) ])
+  -- Grid fallback for page streaming (unbounded; Postgres is not the
+  -- out-of-core target).
+  streamPages conn tbl k = do
+    rows <- queryDb conn ("SELECT key, blob FROM " <> tbl) []
+    forM_ rows $ \[key, blob] -> k (fromIntegral (sqlToInt key)) (unhex (sqlToText blob))
 
 -- | Raise an exception unless the status is @CommandOk@/@TuplesOk@.
 statusOK :: Result -> Text -> IO ()

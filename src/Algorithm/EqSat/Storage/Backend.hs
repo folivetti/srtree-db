@@ -28,6 +28,7 @@ import Data.Int (Int64)
 import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.ByteString as BS
 
 import Algorithm.EqSat.Egraph (EClassId)
 
@@ -60,6 +61,12 @@ class SqlBackend db where
   -- ('Database.SQLite3') implement this O(1)-memory; others fall back to a grid
   -- 'queryDb' (unbounded, documented).
   streamByOp :: db -> Text -> Int -> [EClassId] -> IO [EClassId]
+  -- | Stream the @key, blob@ rows of a key-value page table (e.g.
+  -- @cstore_page@) to a callback, one at a time, so a full pass over every page
+  -- (e.g. 'pushFit') stays O(1) memory. Drivers with a cursor ('Database.SQLite3')
+  -- implement this; others fall back to a grid 'queryDb' (unbounded, documented).
+  -- The blob is delivered hex-decoded (raw) to the callback.
+  streamPages :: db -> Text -> (Int64 -> BS.ByteString -> IO ()) -> IO ()
   -- | Create the schema (tables, indexes) for this driver.
   createSchemaDb :: db -> IO ()
 
