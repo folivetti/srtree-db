@@ -357,6 +357,28 @@ seedEDB nextId trackDBs nodeToEClass fitMap =
                                  , _sizeDLDB = IntMap.insertWith RangeSet.union sz (RangeSet.singleton (dn, eid)) (_sizeDLDB db2) }
       in db3
 
+-- | Minimal DB seed for the lazily paged path: the pattern trie plus base
+-- scalars (next id, tracking), but NO size/fitness/DL range DBs. The out-of-core
+-- eqsat only reads '_patDB' (the matcher) and the work/analysis/unevaluated
+-- sets; the range DBs are in-memory query structures that would otherwise waste
+-- O(#classes) memory on every loadGraphLazy.
+seedEDBPaged
+  :: Int -> Bool
+  -> HashMap.HashMap ENode EClassId
+  -> EGraphDB
+seedEDBPaged nextId trackDBs nodeToEClass =
+  HashMap.foldlWithKey' addNode trie0 nodeToEClass
+  where
+    trie0 :: EGraphDB
+    trie0 = (emptyDB){ _nextId = nextId, _trackDBs = trackDBs }
+    addNode db en eid =
+      let ids = eid : eChildren en
+          op  = eOpKey en
+          cur = Map.lookup op (_patDB db)
+      in case populate cur ids of
+           Nothing -> db
+           Just t  -> db { _patDB = Map.insert op t (_patDB db) }
+
 -- | Reconstruct an e-graph for out-of-core use: like 'loadGraph' but the
 -- resident e-class map is left empty and an 'EClassPageStore' handle is
 -- installed so classes are streamed in and out of a bounded cache. Structure
@@ -374,19 +396,19 @@ loadGraphLazy db = do
     Just (nextId, trackDBs) -> do
       enodes <- readNodes db
       ecLst  <- readClasses db
-      fit    <- readFit db
       let canon0  = IntMap.fromList [ (eid, c) | (eid, c, _) <- ecLst ]
           rep eid = IntMap.findWithDefault eid eid canon0
           nodeToEClass0 = HashMap.fromList enodes
           nodeToEClass  = HashMap.map rep nodeToEClass0
-          fitMap        = IntMap.fromList fit
       ps <- openClassStore db defaultClassCap 1000
       pages <- allPages ps
       if null pages
         then do
           -- fully relational fallback (databases written before the page store)
+          fit <- readFit db
           parents <- readParents db
-          let storedParents = IntMap.fromListWith Set.union
+          let fitMap = IntMap.fromList fit
+              storedParents = IntMap.fromListWith Set.union
                 [ (c, Set.singleton (pEid, pEn))
                 | (c, pEid, pEn) <- parents ]
               classes = buildClasses canon0 nodeToEClass storedParents fitMap
@@ -394,8 +416,11 @@ loadGraphLazy db = do
               rows    = GraphRows canon0 nodeToEClass classes nextId trackDBs
           pure (importEGraph rows)
         else do
-          -- lazily paged: empty resident map + store handle + seeded DBs
-          let eDB = seedEDB nextId trackDBs nodeToEClass fitMap
+          -- lazily paged: empty resident map + store handle + seeded DBs.
+          -- Use the minimal seed (pattern DB only, no size/fitness/DL range DBs):
+          -- runEqSat only reads _patDB; the range DBs are in-memory query
+          -- structures, so building them here wastes O(#classes) memory.
+          let eDB = seedEDBPaged nextId trackDBs nodeToEClass
               eg  = EGraph canon0 nodeToEClass IntMap.empty eDB (Just (classStoreHandle ps))
           pure (Right eg)
 
