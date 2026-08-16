@@ -19,6 +19,7 @@ module Algorithm.EqSat.Storage.Postgres
 
 import Control.Monad (forM)
 import Data.ByteString (ByteString)
+import qualified Data.IntSet as IntSet
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -27,7 +28,7 @@ import Database.PostgreSQL.LibPQ
   , connectdb, exec, execParams, finish, getvalue, invalidOid, nfields
   , ntuples, resultErrorMessage, resultStatus, toColumn, toRow )
 
-import Algorithm.EqSat.Storage.Backend (SqlValue(..), SqlBackend(..))
+import Algorithm.EqSat.Storage.Backend (SqlValue(..), SqlBackend(..), sqlToInt)
 
 -- | PostgreSQL DDL. Mirrors 'Algorithm.EqSat.Storage.Schema.schemaSQL'.
 --
@@ -121,6 +122,10 @@ instance SqlBackend Connection where
     r <- pgExecParams conn sql params
     statusOK r "run"
 
+  insertIgnore conn tail params = do
+    r <- pgExecParams conn ("INSERT INTO " <> tail <> " ON CONFLICT DO NOTHING") params
+    statusOK r "insertIgnore"
+
   queryDb conn sql params = do
     r <- pgExecParams conn sql params
     st <- resultStatus r
@@ -141,6 +146,17 @@ instance SqlBackend Connection where
         pure []
 
   createSchemaDb conn = mapM_ (execDb conn) schemaPostgres
+
+  -- Grid fallback (Postgres is not the out-of-core target): the cursor-based
+  -- streaming matcher needs 'Database.SQLite3'; here we return the full
+  -- distinct set up to @budget@, documented as unbounded memory.
+  streamByOp conn opDetail budget exclude = do
+    let ex = IntSet.fromList exclude
+    rows <- queryDb conn
+      "SELECT DISTINCT n.eid FROM eclass_node n \
+      \JOIN enode e ON e.key = n.enode_key WHERE e.op_detail = ?"
+      [SqlText opDetail]
+    pure (take budget [ eid | [eid'] <- rows, let eid = sqlToInt eid', not (IntSet.member eid ex) ])
 
 -- | Raise an exception unless the status is @CommandOk@/@TuplesOk@.
 statusOK :: Result -> Text -> IO ()

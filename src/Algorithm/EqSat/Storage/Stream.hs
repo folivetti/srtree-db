@@ -11,12 +11,14 @@
 module Algorithm.EqSat.Storage.Stream
   ( streamByOpCount
   , streamMatchNAry
+  , streamRootsByOp
   ) where
 
 import Database.SQLite3
   ( Database, SQLData(..), StepResult(..)
   , bind, columns, step, withStatement )
 import qualified Data.Text as T
+import qualified Data.IntSet as IntSet
 
 import Algorithm.EqSat.Egraph (EClassId, ENode(..))
 import Algorithm.EqSat.Storage.Types (parseEnodeKey)
@@ -36,7 +38,7 @@ streamByOpCount db op = withStatement db
         Done -> pure n
         Row  -> go stmt (n + 1)
 
--- | Stream @eclass_node JOIN enode@ for a given operator, reconstruct each node
+-- | Stream the @eclass_node JOIN enode@ for a given operator, reconstruct each node
 -- from its content key, and collect at most @budget@ e-class ids that actually
 -- contain a node of that operator. Memory is O(@budget@), not O(nodes).
 streamMatchNAry :: Database -> T.Text -> Int -> IO [EClassId]
@@ -63,3 +65,29 @@ streamMatchNAry db opBudget budget = withStatement db
               if ok
                 then go stmt (budgetLeft - 1) (eid : acc)
                 else go stmt budgetLeft acc
+
+-- | Stream the distinct e-class ids that contain a node of a given @op_detail@
+-- through a SQLite cursor, stopping after @budget@ non-excluded rows. This is
+-- the O(1)-memory candidate-root source for the streaming n-ary matcher: it
+-- never materializes the whole (operator -> root set) index in RAM. Memory is
+-- O(@budget@ + size of @exclude@).
+streamRootsByOp :: Database -> T.Text -> Int -> [EClassId] -> IO [EClassId]
+streamRootsByOp db opDetail budget exclude = withStatement db
+  "SELECT DISTINCT n.eid FROM eclass_node n \
+  \JOIN enode e ON e.key = n.enode_key WHERE e.op_detail = ?" $ \stmt -> do
+    bind stmt [SQLText opDetail]
+    let ex = IntSet.fromList exclude
+    go stmt ex budget []
+  where
+    go stmt ex n acc
+      | n <= 0 = pure (reverse acc)
+      | otherwise = do
+          r <- step stmt
+          case r of
+            Done -> pure (reverse acc)
+            Row  -> do
+              cols <- columns stmt
+              let eid = case cols of (SQLInteger i : _) -> fromIntegral i; _ -> 0
+              if IntSet.member eid ex
+                then go stmt ex n acc
+                else go stmt ex (n - 1) (eid : acc)

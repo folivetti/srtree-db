@@ -63,6 +63,7 @@ import Algorithm.EqSat.Storage.Backend
 import Algorithm.EqSat.Storage.ClassStore
   ( classStoreTable, openClassStore, allPages, classStoreHandle, hex )
 import Algorithm.EqSat.Storage.Query (readDatasetFit, writeDatasetFit)
+import Algorithm.EqSat.Storage.Stream (streamRootsByOp)
 import Algorithm.EqSat.Storage.Types
 import Algorithm.EqSat.Storage.Schema (createSchema, schemaSQL)
 
@@ -79,6 +80,10 @@ instance SqlBackend Database where
     bind stmt (map toSqlData params)
     _ <- step stmt
     pure ()
+  insertIgnore db tail params = withStatement db ("INSERT OR IGNORE INTO " <> tail) $ \stmt -> do
+    bind stmt (map toSqlData params)
+    _ <- step stmt
+    pure ()
   queryDb db sql params = withStatement db sql $ \stmt -> do
     bind stmt (map toSqlData params)
     go stmt []
@@ -90,6 +95,11 @@ instance SqlBackend Database where
           Row  -> do
             cols <- columns stmt
             go stmt (map fromSqlData cols : acc)
+  -- O(1)-memory candidate-root enumeration: stream the distinct e-class ids by
+  -- operator through a cursor, skipping the already-attempted set, and stop
+  -- after @budget@ rows, so the matcher never materializes the whole (operator
+  -- -> root set) index in RAM.
+  streamByOp db opDetail budget exclude = streamRootsByOp db opDetail budget exclude
   createSchemaDb db = mapM_ (exec db) schemaSQL
 
 toSqlData :: SqlValue -> SQLData

@@ -29,6 +29,8 @@ import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 
+import Algorithm.EqSat.Egraph (EClassId)
+
 -- | A driver-neutral value bound to a @?@ parameter or returned by a query.
 data SqlValue = SqlInteger Int64
               | SqlFloat   Double
@@ -42,8 +44,22 @@ class SqlBackend db where
   execDb :: db -> Text -> IO ()
   -- | Execute a parameterized statement that returns no rows.
   runDb :: db -> Text -> [SqlValue] -> IO ()
+  -- | Execute an idempotent insert, ignoring any row that would violate a
+  -- primary/unique constraint (re-seeing a node already present). The @Text@
+  -- argument is the @table (cols) VALUES (?,...)@ tail *without* the leading
+  -- @INSERT INTO@ and without a conflict clause; each driver supplies its own
+  -- native prefix/suffix (SQLite @INSERT OR IGNORE INTO@, Postgres @ON
+  -- CONFLICT DO NOTHING@).
+  insertIgnore :: db -> Text -> [SqlValue] -> IO ()
   -- | Run a parameterized query and return the raw result grid.
   queryDb :: db -> Text -> [SqlValue] -> IO [[SqlValue]]
+  -- | Stream (bounded) the distinct e-class ids whose e-class contains a node
+  -- with the given @op_detail@, for the streaming matcher, skipping any ids in
+  -- @exclude@ (the already-attempted seen-set, so the per-rule budget advances
+  -- to new roots across scheduler cycles). Drivers that expose a cursor
+  -- ('Database.SQLite3') implement this O(1)-memory; others fall back to a grid
+  -- 'queryDb' (unbounded, documented).
+  streamByOp :: db -> Text -> Int -> [EClassId] -> IO [EClassId]
   -- | Create the schema (tables, indexes) for this driver.
   createSchemaDb :: db -> IO ()
 

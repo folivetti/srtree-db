@@ -8,11 +8,12 @@ module Algorithm.EqSat.Storage.Types
   , enodeChildren
   , enodeOpTag
   , enodeOpDetail
+  , opDetailOf
   , serializeTheta
   , parseTheta
   ) where
 
-import Data.SRTree.Internal (Op(..), Function(..))
+import Data.SRTree.Internal (Op(..), Function(..), SRTree(..))
 import Data.SRTree.Eval (Target)
 import Algorithm.EqSat.Egraph (ENode(..), EClassId, NOp(..))
 
@@ -93,6 +94,21 @@ enodeOpDetail (EConst _)  = "Const"
 enodeOpDetail (EUni f _)  = show f
 enodeOpDetail (EBin op _ _) = show op
 enodeOpDetail (ENAry op _)  = showNOp op
+
+-- | The @op_detail@ column value matching an operator-key shape (@SRTree ()@,
+-- as produced by 'Algorithm.EqSat.Egraph.eOpKey' / pattern @opOf@). N-ary
+-- Add/Mul patterns address the flattened ENAry nodes, whose @op_detail@ is
+-- @EAdd@/@EMul@, so the binary shapes @Bin Add@/@Bin Mul@ map there; other
+-- operators map to their own detail.
+opDetailOf :: SRTree () -> String
+opDetailOf (Var _)    = "Var"
+opDetailOf (Param _)  = "Param"
+opDetailOf (Const _)  = "Const"
+opDetailOf (Y _)      = "Var"
+opDetailOf (Uni f _)  = show f
+opDetailOf (Bin Add _ _) = showNOp EAdd
+opDetailOf (Bin Mul _ _) = showNOp EMul
+opDetailOf (Bin op _ _)  = show op
 
 -- | Flatten a list of target vectors: vectors joined by @|@, elements by @,@.
 serializeTheta :: [Target] -> String

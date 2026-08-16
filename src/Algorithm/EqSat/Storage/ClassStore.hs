@@ -50,14 +50,21 @@ module Algorithm.EqSat.Storage.ClassStore
 import Control.Monad (forM_, unless, when)
 import Data.IORef
 import qualified Data.IntMap.Strict as IM
+import qualified Data.IntSet as IntSet
 import qualified Data.Map.Strict as Map
 import qualified Data.ByteString as BS
+import qualified Data.HashSet as Set
 import qualified Data.Text as T
 import Data.Binary (encode, decode)
+import Data.List (nub)
 import qualified Data.ByteString.Lazy as BL
 
-import Algorithm.EqSat.Storage.Backend (SqlValue(..), SqlBackend(..), sqlToInt, sqlToText)
-import Algorithm.EqSat.Egraph (EClass, EClassPageStore(..), _eClassId)
+import Algorithm.EqSat.Storage.Backend
+  ( SqlValue(..), SqlBackend(..), sqlToInt, sqlToText )
+import Algorithm.EqSat.Storage.Types
+  ( enodeKey, enodeOpTag, enodeOpDetail, opDetailOf )
+import Algorithm.EqSat.Egraph
+  ( EClass, EClassPageStore(..), ENode, _eClassId )
 
 -- ---------------------------------------------------------------------------
 -- hex encoding of page blobs (driver-neutral TEXT storage)
@@ -137,6 +144,7 @@ data PageStore db = PageStore
   { psDb        :: db
   , psTable     :: !T.Text
   , psCache     :: !(IORef PageCache)
+  , psNodes     :: !(IORef (Set.HashSet (Int, ENode))) -- newly-created nodes awaiting write-back
   , psCap       :: !Int
   , psFlushEvery :: !Int
   }
@@ -152,7 +160,8 @@ newPageStore db tbl cap flushEvery' = do
     ("CREATE TABLE IF NOT EXISTS " <> tbl <>
      " (key TEXT PRIMARY KEY, blob TEXT NOT NULL)")
   cache <- newIORef (emptyCache cap)
-  pure (PageStore db tbl cache cap flushEvery')
+  nodes <- newIORef Set.empty
+  pure (PageStore db tbl cache nodes cap flushEvery')
 
 -- | Read the page for @eid@ (cache miss loads from the database). Refreshes
 -- LRU recency on hit so hot classes stay resident.
@@ -218,7 +227,29 @@ writeback ps = do
         [ SqlInteger (fromIntegral eid), SqlText (hex page) ]
     execDb db "COMMIT"
     modifyIORef' (psCache ps) (\cc -> cc { pcPend = IM.empty, pcPendN = 0 })
+  flushNodes ps
   pure (length pend)
+
+-- | Flush any newly-created nodes recorded via 'cpsRecordNode' into the
+-- relational @enode@/@eclass_node@ tables (idempotently), so the streaming
+-- matcher's @op_detail@ index reflects the live graph. Runs inside its own
+-- transaction (the page write-back above may be a no-op).
+flushNodes :: SqlBackend db => PageStore db -> IO ()
+flushNodes ps = do
+  nodes <- readIORef (psNodes ps)
+  unless (Set.null nodes) $ do
+    let db = psDb ps
+    execDb db "BEGIN"
+    forM_ (Set.toList nodes) $ \(eid, en) -> do
+      let key = T.pack (enodeKey en)
+      insertIgnore db "enode (key, op, op_detail) VALUES (?, ?, ?)"
+        [ SqlText key
+        , SqlText (T.pack (enodeOpTag en))
+        , SqlText (T.pack (enodeOpDetail en)) ]
+      insertIgnore db "eclass_node (eid, enode_key) VALUES (?, ?)"
+        [ SqlInteger (fromIntegral eid), SqlText key ]
+    execDb db "COMMIT"
+    modifyIORef' (psNodes ps) (const Set.empty)
 
 -- | Number of dirty pages not yet written back.
 pendingCount :: PageStore db -> IO Int
@@ -271,4 +302,19 @@ classStoreHandle ps = EClassPageStore
   , cpsFlush  = writeback ps >> pure ()
   , cpsAll    = fmap (map (decode . BL.fromStrict . snd)) (allPages ps)
   , cpsKeys   = allPageKeys ps
+  , cpsStreamRoots = \op budget exclude -> do
+      -- Union the DB's operator index with any not-yet-flushed nodes, so the
+      -- streaming matcher sees every live node (like the resident _patDB trie),
+      -- not just the last flushed snapshot. Excluded (already-attempted) roots
+      -- are skipped so the per-rule budget advances to new roots. Memory is
+      -- O(budget + pending + size of exclude).
+      dbRoots <- streamByOp (psDb ps) (T.pack (opDetailOf op)) budget exclude
+      pend <- readIORef (psNodes ps)
+      let detail = opDetailOf op
+          ex = IntSet.fromList exclude
+          pendRoots = [ eid | (eid, en) <- Set.toList pend
+                            , enodeOpDetail en == detail
+                            , not (IntSet.member eid ex) ]
+      pure (take budget (nub (pendRoots ++ dbRoots)))
+  , cpsRecordNode  = \en eid -> modifyIORef' (psNodes ps) (Set.insert (eid, en))
   }
