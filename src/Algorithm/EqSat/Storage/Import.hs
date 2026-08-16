@@ -48,6 +48,7 @@ import Algorithm.EqSat.Storage.ClassStore (classStoreTable, hex)
 import Algorithm.EqSat.Storage.Types
   ( enodeKey, enodeOpTag, enodeOpDetail, serializeTheta, parseTheta, parseEnodeKey )
 import Algorithm.EqSat.Storage.Schema (createSchema)
+import Algorithm.EqSat.Storage.Query (getOrCreateDataset, writeDatasetFit)
 
 -- | Result of an out-of-core import.
 data ImportSummary = ImportSummary
@@ -66,12 +67,13 @@ data ImportState = ImportState
 -- structurally expanding every subexpression into its own e-class, then write
 -- the class pages in a final linear pass. Runs inside a single transaction
 -- (rolled back on error).
-importEqs :: SqlBackend db => db -> [(Fix SRTree, [Target], Maybe Double)] -> IO (Either String ImportSummary)
-importEqs db eqs = do
+importEqs :: SqlBackend db => db -> String -> [(Fix SRTree, [Target], Maybe Double)] -> IO (Either String ImportSummary)
+importEqs db ds eqs = do
   createSchema db
   -- content-address dedup queries by enode_key, but eclass_node's PK is
   -- (eid, enode_key); index enode_key so those lookups are O(log n) not a scan.
   execDb db "CREATE INDEX IF NOT EXISTS idx_eclass_node_enode_key ON eclass_node(enode_key)"
+  dsid <- getOrCreateDataset db ds
   ref <- newIORef (ImportState 0)
   r <- try $ do
     execDb db "BEGIN"
@@ -80,8 +82,9 @@ importEqs db eqs = do
     -- is processed; the fold accumulator carries the count, so we never retain
     -- the whole parsed expression list in memory.
     n <- foldM (\c (t, theta, fit) -> do
-                   (eid, h) <- insertTree ref db fit t
+                   (eid, h) <- insertTree ref db fit dsid t
                    insertFit db eid theta fit h
+                   writeDatasetFit db dsid eid fit Nothing (T.pack (serializeTheta theta)) h
                    pure (c + 1)) 0 eqs
     writeMeta db ref
     writeAllPages db
@@ -96,33 +99,33 @@ importEqs db eqs = do
       pure (Right (ImportSummary (stNextId st) (stNextId st) n))
 
 -- | Insert a full tree bottom-up, returning its root e-class id and height.
-insertTree :: SqlBackend db => IORef ImportState -> db -> Maybe Double -> Fix SRTree -> IO (EClassId, Int)
-insertTree ref db fit t = case unfix t of
-  Var ix     -> insertNode ref db fit (EVar ix) []
-  Param ix   -> insertNode ref db fit (EParam ix) []
-  Const x    -> insertNode ref db fit (EConst x) []
+insertTree :: SqlBackend db => IORef ImportState -> db -> Maybe Double -> Int -> Fix SRTree -> IO (EClassId, Int)
+insertTree ref db fit dsid t = case unfix t of
+  Var ix     -> insertNode ref db fit dsid (EVar ix) []
+  Param ix   -> insertNode ref db fit dsid (EParam ix) []
+  Const x    -> insertNode ref db fit dsid (EConst x) []
   Uni f sub  -> do
-    (c, ch) <- insertTree ref db fit sub
-    insertNode ref db fit (EUni f c) [(c, 1, ch)]
-  Bin Add l r -> insertNAry ref db fit EAdd l r
-  Bin Mul l r -> insertNAry ref db fit EMul l r
+    (c, ch) <- insertTree ref db fit dsid sub
+    insertNode ref db fit dsid (EUni f c) [(c, 1, ch)]
+  Bin Add l r -> insertNAry ref db fit dsid EAdd l r
+  Bin Mul l r -> insertNAry ref db fit dsid EMul l r
   Bin op l r  -> do
-    (lc, lh) <- insertTree ref db fit l
-    (rc, rh) <- insertTree ref db fit r
-    insertNode ref db fit (EBin op lc rc) [(lc, 1, lh), (rc, 1, rh)]
+    (lc, lh) <- insertTree ref db fit dsid l
+    (rc, rh) <- insertTree ref db fit dsid r
+    insertNode ref db fit dsid (EBin op lc rc) [(lc, 1, lh), (rc, 1, rh)]
 
 -- | Insert a flattened n-ary node (@Add@/@Mul@), merging nested same-op chains
 -- the same way 'mkENaryM' does (a child whose class holds a single same-op
 -- ENAry is flattened in). Children and their heights are read from the DB.
-insertNAry :: SqlBackend db => IORef ImportState -> db -> Maybe Double -> NOp -> Fix SRTree -> Fix SRTree -> IO (EClassId, Int)
-insertNAry ref db fit op l r = do
-  (c1, _) <- insertTree ref db fit l
-  (c2, _) <- insertTree ref db fit r
+insertNAry :: SqlBackend db => IORef ImportState -> db -> Maybe Double -> Int -> NOp -> Fix SRTree -> Fix SRTree -> IO (EClassId, Int)
+insertNAry ref db fit dsid op l r = do
+  (c1, _) <- insertTree ref db fit dsid l
+  (c2, _) <- insertTree ref db fit dsid r
   flat <- flattenChildren db op [(c1, 1), (c2, 1)]
   childsH <- forM (IntMap.toList flat) $ \(c, n) -> do
     h <- classHeight db c
     pure (c, n, h)
-  insertNode ref db fit (ENAry op flat) childsH
+  insertNode ref db fit dsid (ENAry op flat) childsH
 
 -- | Flatten @n@ occurrences of @cid@ when its class holds exactly one ENAry of
 -- the same op (scaled by @n@); otherwise keep @cid@. Each child's node is read
@@ -138,8 +141,8 @@ flattenChildren db op children = do
 
 -- | Content-addressed insert of a single e-node. Returns the e-class id and
 -- height of the node (reusing the existing class when already present).
-insertNode :: SqlBackend db => IORef ImportState -> db -> Maybe Double -> ENode -> [(EClassId, Int, Int)] -> IO (EClassId, Int)
-insertNode ref db fit en children = do
+insertNode :: SqlBackend db => IORef ImportState -> db -> Maybe Double -> Int -> ENode -> [(EClassId, Int, Int)] -> IO (EClassId, Int)
+insertNode ref db fit dsid en children = do
   let key   = enodeKey en
       childs = dedupChildren children
   mEid <- lookupEnodeId db key
@@ -152,7 +155,7 @@ insertNode ref db fit en children = do
       let eid = stNextId st
           h   = 1 + maximum (0 : [ ch | (_, _, ch) <- childs ])
       writeIORef ref (st { stNextId = eid + 1 })
-      writeNode db eid en key childs h fit
+      writeNode db eid en key childs h fit dsid
       pure (eid, h)
 
 -- | Merge duplicate child e-classes into multiplicities (e.g. @x0 - x0@ has
@@ -165,8 +168,8 @@ dedupChildren =
 
 -- | Write the relational rows for a brand-new e-node. Reverse parent edges go
 -- straight to the @parent@ table (reconstructed into pages by 'writeAllPages').
-writeNode :: SqlBackend db => db -> EClassId -> ENode -> String -> [(EClassId, Int, Int)] -> Int -> Maybe Double -> IO ()
-writeNode db eid en key children h fit = do
+writeNode :: SqlBackend db => db -> EClassId -> ENode -> String -> [(EClassId, Int, Int)] -> Int -> Maybe Double -> Int -> IO ()
+writeNode db eid en key children h fit dsid = do
   runDb db "INSERT INTO enode (key, op, op_detail) VALUES (?, ?, ?)"
     [ SqlText (T.pack key)
     , SqlText (T.pack (enodeOpTag en))
@@ -189,9 +192,11 @@ writeNode db eid en key children h fit = do
       [ SqlInteger (fromIntegral c)
       , SqlInteger (fromIntegral eid)
       , SqlText (T.pack key) ]
-  -- every class gets a fit row so the graph is fitness-annotated (dbTop ranks
-  -- by it); the root's proper params/theta are written by the caller.
+  -- every class gets a fit row (legacy) and a dataset_fit row so the graph is
+  -- fitness-annotated per dataset; the root's proper params/theta are written
+  -- by the caller.
   insertFit db eid [] fit h
+  writeDatasetFit db dsid eid fit Nothing "" h
 
 -- | ENAry children as (class, multiplicity); empty for all other node shapes
 -- (their children live inline in the content key).
