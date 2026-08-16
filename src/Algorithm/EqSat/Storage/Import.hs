@@ -25,7 +25,7 @@ module Algorithm.EqSat.Storage.Import
   , importEqs
   ) where
 
-import Control.Monad (forM, forM_)
+import Control.Monad (forM, forM_, foldM)
 import Control.Exception (SomeException, catch, displayException, try)
 import Data.IORef (IORef, newIORef, readIORef, modifyIORef', writeIORef)
 import Data.Maybe (catMaybes, fromMaybe)
@@ -75,19 +75,25 @@ importEqs db eqs = do
   ref <- newIORef (ImportState 0)
   r <- try $ do
     execDb db "BEGIN"
-    forM_ eqs $ \(t, theta, fit) -> do
-      (eid, h) <- insertTree ref db fit t
-      insertFit db eid theta fit h
+    -- stream the expression list through a fold (rather than forM_ + length
+    -- eqs) so the lazy list is unreferenced after consumption and GC'd as it
+    -- is processed; the fold accumulator carries the count, so we never retain
+    -- the whole parsed expression list in memory.
+    n <- foldM (\c (t, theta, fit) -> do
+                   (eid, h) <- insertTree ref db fit t
+                   insertFit db eid theta fit h
+                   pure (c + 1)) 0 eqs
     writeMeta db ref
     writeAllPages db
     execDb db "COMMIT"
+    pure n
   case r of
     Left (e :: SomeException) -> do
       _ <- (execDb db "ROLLBACK" `catch` \(_ :: SomeException) -> pure ())
       pure (Left ("importEqs failed: " <> displayException e))
-    Right () -> do
+    Right n -> do
       st <- readIORef ref
-      pure (Right (ImportSummary (stNextId st) (stNextId st) (length eqs)))
+      pure (Right (ImportSummary (stNextId st) (stNextId st) n))
 
 -- | Insert a full tree bottom-up, returning its root e-class id and height.
 insertTree :: SqlBackend db => IORef ImportState -> db -> Maybe Double -> Fix SRTree -> IO (EClassId, Int)
