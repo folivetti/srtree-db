@@ -21,6 +21,7 @@ library
     Algorithm.EqSat.Storage.Backend
     Algorithm.EqSat.Storage.ClassStore
     Algorithm.EqSat.Storage.Import
+    Algorithm.EqSat.Storage.Stream
     Algorithm.EqSat.Storage.Schema
     Algorithm.EqSat.Storage.SQLite
     Algorithm.EqSat.Storage.Postgres
