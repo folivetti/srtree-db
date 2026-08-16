@@ -62,6 +62,7 @@ import Algorithm.EqSat.Storage.Backend
   ( SqlValue(..), SqlBackend(..), sqlToInt, sqlToMaybeDouble, sqlToText )
 import Algorithm.EqSat.Storage.ClassStore
   ( classStoreTable, openClassStore, allPages, classStoreHandle, hex )
+import Algorithm.EqSat.Storage.Query (readDatasetFit, writeDatasetFit)
 import Algorithm.EqSat.Storage.Types
 import Algorithm.EqSat.Storage.Schema (createSchema, schemaSQL)
 
@@ -121,8 +122,8 @@ run = runDb
 -- Every canonical e-class is written as a serialized page to @cstore_page@ in
 -- addition to the normalized relational schema, so the graph round-trips
 -- through the lazily paged 'loadGraph' as well as the relational path.
-saveGraph :: SqlBackend db => db -> EGraph -> IO (Either String ())
-saveGraph db eg = do
+saveGraph :: SqlBackend db => db -> Int -> EGraph -> IO (Either String ())
+saveGraph db dsid eg = do
   createSchema db
   let rows0 = exportEGraph eg
   gr <- graphClassRows eg
@@ -135,6 +136,7 @@ saveGraph db eg = do
       writeClasses db rows
       writeParents db rows
       writeFit db rows
+      writeDatasetFitRows db dsid rows
       writeClassPages db rows
       execDb db "COMMIT"
       pure (Right ()))
@@ -233,6 +235,8 @@ writeParents db rows =
 
 -- | Insert a @fit@ row. NULL fitness/DL are expressed as literal @NULL@ (the
 -- shared SQL is therefore driver-neutral).
+-- | Write the legacy @fit@ rows (kept for the non-dataset 'loadGraph' test
+-- loader; the dataset-aware path uses 'writeDatasetFitRows').
 writeFit :: SqlBackend db => db -> GraphRows -> IO ()
 writeFit db rows =
   forM_ (IntMap.toAscList (_grEClasses rows)) $ \(eid, r) -> do
@@ -246,14 +250,21 @@ writeFit db rows =
         (dlCol, dlVal)   = case dl of
                              Nothing -> ("NULL", Nothing)
                              Just d  -> ("?", Just (SqlFloat d))
-        vals = [ Just (SqlInteger (fromIntegral eid))
-               , fitVal
-               , dlVal
-               , Just (SqlText (T.pack (serializeTheta (_theta info))))
-               , Just (SqlInteger (fromIntegral sz)) ]
     run db ("INSERT INTO fit (eid, fitness, dl, theta, size) VALUES (?, "
               <> fitCol <> ", " <> dlCol <> ", ?, ?)")
-      (catMaybes vals)
+      (catMaybes [ Just (SqlInteger (fromIntegral eid))
+                 , fitVal
+                 , dlVal
+                 , Just (SqlText (T.pack (serializeTheta (_theta info))))
+                 , Just (SqlInteger (fromIntegral sz)) ])
+
+-- | Write the per-(dataset, e-class) fitness rows for every class in a graph.
+writeDatasetFitRows :: SqlBackend db => db -> Int -> GraphRows -> IO ()
+writeDatasetFitRows db dsid rows =
+  forM_ (IntMap.toAscList (_grEClasses rows)) $ \(eid, r) -> do
+    let info = _rcInfo r
+    writeDatasetFit db dsid eid (_fitness info) (_dl info)
+      (T.pack (serializeTheta (_theta info))) (_size info)
 
 -- ---------------------------------------------------------------------------
 -- reading
@@ -388,27 +399,28 @@ seedEDBPaged nextId trackDBs nodeToEClass =
 -- This bounds peak memory (the whole class set is never resident at once).
 -- Use it with 'MonadIO'-based ('ClassStore') operations; the pure instances
 -- expect a complete resident map and are not suitable for a lazy graph.
-loadGraphLazy :: SqlBackend db => db -> IO (Either String EGraph)
-loadGraphLazy db = do
+loadGraphLazy :: SqlBackend db => db -> Int -> IO (Either String EGraph)
+loadGraphLazy db dsid = do
   m <- readMeta db
   case m of
     Nothing -> pure (Left "srtree-db: no e-graph stored in this database")
     Just (nextId, trackDBs) -> do
       enodes <- readNodes db
       ecLst  <- readClasses db
+      dsFit  <- readDatasetFit db dsid
       let canon0  = IntMap.fromList [ (eid, c) | (eid, c, _) <- ecLst ]
           rep eid = IntMap.findWithDefault eid eid canon0
           nodeToEClass0 = HashMap.fromList enodes
           nodeToEClass  = HashMap.map rep nodeToEClass0
+          fitMap = IntMap.fromList [ (eid, (f, d, sz, parseTheta (T.unpack th)))
+                                   | (eid, (f, d, sz, th)) <- dsFit ]
       ps <- openClassStore db defaultClassCap 1000
       pages <- allPages ps
       if null pages
         then do
           -- fully relational fallback (databases written before the page store)
-          fit <- readFit db
           parents <- readParents db
-          let fitMap = IntMap.fromList fit
-              storedParents = IntMap.fromListWith Set.union
+          let storedParents = IntMap.fromListWith Set.union
                 [ (c, Set.singleton (pEid, pEn))
                 | (c, pEid, pEn) <- parents ]
               classes = buildClasses canon0 nodeToEClass storedParents fitMap
@@ -420,9 +432,24 @@ loadGraphLazy db = do
           -- Use the minimal seed (pattern DB only, no size/fitness/DL range DBs):
           -- runEqSat only reads _patDB; the range DBs are in-memory query
           -- structures, so building them here wastes O(#classes) memory.
-          let eDB = seedEDBPaged nextId trackDBs nodeToEClass
-              eg  = EGraph canon0 nodeToEClass IntMap.empty eDB (Just (classStoreHandle ps))
+          -- Fitness is dataset metadata, applied on page reads (not baked into
+          -- the structural page blobs).
+          let base = classStoreHandle ps
+              h    = base { cpsLookup = \eid ->
+                              fmap (fmap (applyDsFit fitMap eid)) (cpsLookup base eid) }
+              eDB  = seedEDBPaged nextId trackDBs nodeToEClass
+              eg   = EGraph canon0 nodeToEClass IntMap.empty eDB (Just h)
           pure (Right eg)
+
+-- | Apply a dataset's fitness metadata to a class read from the structural page
+-- store (fitness/dl/theta/size are dataset-specific, so they are attached on
+-- read rather than stored in the page blob).
+applyDsFit
+  :: IntMap.IntMap (Maybe Double, Maybe Double, Int, [Target])
+  -> EClassId -> EClass -> EClass
+applyDsFit m eid ec = case IntMap.lookup eid m of
+  Nothing -> ec
+  Just (f, dl, sz, th) -> ec { _info = (_info ec) { _fitness = f, _dl = dl, _size = sz, _theta = th } }
 
 readMeta :: SqlBackend db => db -> IO (Maybe (Int, Bool))
 readMeta db = do
@@ -512,24 +539,25 @@ buildClasses canon nodeToEClass storedParents fit heights =
     headOrDefault def []    = def
     headOrDefault _   (x:_) = x
 
--- | Push the graph's risk metrics into the @fit@ table (leaves structure intact).
-pushFit :: SqlBackend db => db -> EGraph -> IO ()
-pushFit db eg = do
+-- | Push the graph's risk metrics into the @dataset_fit@ table for a dataset
+-- (leaves structure intact).
+pushFit :: SqlBackend db => db -> Int -> EGraph -> IO ()
+pushFit db dsid eg = do
   createSchema db
   let rows0 = exportEGraph eg
   gr <- graphClassRows eg
-  execDb db "DELETE FROM fit"
-  writeFit db (rows0 { _grEClasses = gr })
+  run db "DELETE FROM dataset_fit WHERE dataset_id = ?" [SqlInteger (fromIntegral dsid)]
+  writeDatasetFitRows db dsid (rows0 { _grEClasses = gr })
 
 -- | Overwrite in-memory fitness/DL with the values currently stored in the
--- database (per e-class, by canonical id).
-refreshFitness :: SqlBackend db => db -> EGraph -> IO (Either String EGraph)
-refreshFitness db eg = do
-  fits <- readFit db
-  let m = forM_ fits $ \(eid, (fitM, _, _, theta)) ->
+-- database for a dataset (per e-class, by canonical id).
+refreshFitness :: SqlBackend db => db -> Int -> EGraph -> IO (Either String EGraph)
+refreshFitness db dsid eg = do
+  dsFit <- readDatasetFit db dsid
+  let m = forM_ dsFit $ \(eid, (fitM, _, _, theta)) ->
             case fitM of
               Nothing -> pure ()
               Just f  -> do
                 c <- canonical eid
-                insertFitness c f theta
+                insertFitness c f (parseTheta (T.unpack theta))
   pure (Right (runIdentity $ execStateT m eg))

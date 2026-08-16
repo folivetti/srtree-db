@@ -85,6 +85,16 @@ importEqs db ds eqs = do
                    (eid, h) <- insertTree ref db fit dsid t
                    insertFit db eid theta fit h
                    writeDatasetFit db dsid eid fit Nothing (T.pack (serializeTheta theta)) h
+                   -- record the root expression in the registry (keyed by its
+                   -- canonical root node) so "was this expression seen/tested?"
+                   -- can be answered per dataset.
+                   mroot <- lookupClassNode db eid
+                   forM_ mroot $ \en ->
+                     runDb db
+                       "INSERT OR REPLACE INTO expression_index (expression_key, eclass, dataset_id) VALUES (?, ?, ?)"
+                       [ SqlText (T.pack (enodeKey en))
+                       , SqlInteger (fromIntegral eid)
+                       , SqlInteger (fromIntegral dsid) ]
                    pure (c + 1)) 0 eqs
     writeMeta db ref
     writeAllPages db
@@ -253,16 +263,10 @@ writeAllPages db = do
         let parents = HashSet.fromList
               [ (sqlToInt pe, fromMaybe (error "importEqs: bad parent key") (parseEnodeKey (T.unpack (sqlToText pk))))
               | [pe, pk] <- pr ]
-        fit <- queryDb db "SELECT fitness, dl, theta, size FROM fit WHERE eid = ?"
-                        [SqlInteger (fromIntegral eid)]
-        let (f, dl, theta, sz) = case fit of
-              ([fcol, dlcol, tcol, scol] : _) ->
-                ( sqlToMaybeDouble fcol
-                , sqlToMaybeDouble dlcol
-                , parseTheta (T.unpack (sqlToText tcol))
-                , sqlToInt scol )
-              _ -> (Nothing, Nothing, [], 0)
-        writeClassPage db eid (EClass eid (HashSet.singleton en) parents h (defaultInfo en f dl theta sz))
+        -- Pages are structural-only: cost/best are derived on load, and
+        -- fitness/dl/theta are dataset metadata (dataset_fit), so they are NOT
+        -- baked into the e-graph blob (keeps the graph reusable across datasets).
+        writeClassPage db eid (EClass eid (HashSet.singleton en) parents h (defaultInfo en h))
       _ -> pure ()
 
 -- | Serialize an e-class to the page store (INSERT OR REPLACE so the final
@@ -277,8 +281,8 @@ writeClassPage db eid ec =
 -- ('recalculateBestAll'). Fitness/dl/theta/size are baked into the page (so
 -- out-of-core reads via the paged store see them). @_consts@ is set from the
 -- node so constant-folding rules behave identically to the in-memory seed.
-defaultInfo :: ENode -> Maybe Double -> Maybe Double -> [Target] -> Int -> EClassData
-defaultInfo en f dl theta sz = EData 0 en (constOf en) f dl theta sz
+defaultInfo :: ENode -> Int -> EClassData
+defaultInfo en h = EData 0 en (constOf en) Nothing Nothing [] h
 
 constOf :: ENode -> Consts
 constOf (EConst x)   = ConstVal x

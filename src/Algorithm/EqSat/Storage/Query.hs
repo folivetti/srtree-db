@@ -17,6 +17,9 @@ module Algorithm.EqSat.Storage.Query
   , paretoBySize
   , distributionCounts
   , countPattern
+  , expressionEclass
+  , testedOnDataset
+  , versionsOf
   ) where
 
 import Data.Maybe (catMaybes)
@@ -27,10 +30,12 @@ import Algorithm.EqSat.Egraph (EClassId)
 
 import Algorithm.EqSat.Storage.Backend
   ( SqlBackend, SqlValue(..), runDb, queryDb, sqlToInt, sqlToMaybeDouble, sqlToText )
+import Algorithm.EqSat.Storage.Schema (createSchema)
 
 -- | Resolve a dataset name to its @dataset@ row id, creating it if needed.
 getOrCreateDataset :: SqlBackend db => db -> String -> IO Int
 getOrCreateDataset db name = do
+  createSchema db
   m <- datasetId db name
   case m of
     Just i  -> pure i
@@ -74,6 +79,7 @@ readDatasetFit
   :: SqlBackend db => db -> Int
   -> IO [(EClassId, (Maybe Double, Maybe Double, Int, Text))]
 readDatasetFit db ds = do
+  createSchema db
   rows <- queryDb db
     "SELECT eid, fitness, dl, size, theta FROM dataset_fit WHERE dataset_id = ?"
     [SqlInteger (fromIntegral ds)]
@@ -133,6 +139,31 @@ distributionCounts db ds maxSize = do
     \GROUP BY size ORDER BY size"
     [ SqlInteger (fromIntegral ds), SqlInteger (fromIntegral maxSize) ]
   pure [ (sqlToInt s, sqlToInt c) | [s, c] <- rows ]
+
+-- | The e-class a previously-indexed expression maps to (NULL if never seen).
+expressionEclass :: SqlBackend db => db -> Text -> IO (Maybe EClassId)
+expressionEclass db key = do
+  rows <- queryDb db "SELECT eclass FROM expression_index WHERE expression_key = ?"
+                    [SqlText key]
+  pure $ case rows of
+    ([e] : _) -> Just (sqlToInt e)
+    _         -> Nothing
+
+-- | Whether a class has a fitness (i.e. was evaluated/fitted) on a dataset.
+testedOnDataset :: SqlBackend db => db -> Int -> EClassId -> IO Bool
+testedOnDataset db ds eid = do
+  rows <- queryDb db
+    "SELECT 1 FROM dataset_fit WHERE dataset_id = ? AND eid = ? AND fitness IS NOT NULL"
+    [SqlInteger (fromIntegral ds), SqlInteger (fromIntegral eid)]
+  pure (not (null rows))
+
+-- | The e-node content keys that make up an e-class (multiple versions of one
+-- expression).
+versionsOf :: SqlBackend db => db -> EClassId -> IO [Text]
+versionsOf db eid = do
+  rows <- queryDb db "SELECT enode_key FROM eclass_node WHERE eid = ?"
+                    [SqlInteger (fromIntegral eid)]
+  pure [ sqlToText k | [k] <- rows ]
 
 -- | Number of distinct e-classes containing at least one e-node whose
 -- specific operator matches (e.g. \"EAdd\", \"EMul\", \"Add\", \"LogAbs\").

@@ -35,6 +35,8 @@ import Algorithm.EqSat.Queries (findRootClasses)
 import Algorithm.EqSat.Storage.Backend ( SqlValue(..), SqlBackend(..) )
 import Algorithm.EqSat.Storage.ClassStore
 import Algorithm.EqSat.Storage.SQLite
+import Algorithm.EqSat.Storage.Query (getOrCreateDataset)
+import Algorithm.EqSat.Storage.Backend (SqlBackend)
 import Algorithm.EqSat.Storage.Postgres ()
 import qualified Algorithm.EqSat.Storage.Query as Q
 
@@ -55,6 +57,12 @@ evalIn g m = runIdentity $ evalStateT m g
 -- carries one) is exercised write-through.
 runIOIn :: EGraph -> EGraphST IO a -> IO (a, EGraph)
 runIOIn g m = runStateT m g
+
+-- | 'saveGraph' now needs a dataset id; give the tests a fixed dataset.
+saveGraphTest :: SqlBackend db => db -> EGraph -> IO (Either String ())
+saveGraphTest db eg = do
+  dsid <- getOrCreateDataset db "test"
+  saveGraph db dsid eg
 
 -- | x0..x3; add = x0+x1 (fit 0.9), p2 = (x0+x1)*x2 (fit 0.7),
 --            p3 = (x0+x1)*x3 (fit 0.5). Returns (eg, add, p2, p3).
@@ -84,7 +92,7 @@ testSaveLoadRT :: SqlBackend db => IO db -> (db -> IO ()) -> Test
 testSaveLoadRT openDb closeDb = TestCase $ do
   db <- openDb
   (eg, eidAdd, _, eidP3) <- buildGraph
-  _ <- saveGraph db eg
+  _ <- saveGraphTest db eg
   m <- loadGraph db
   case m of
     Left err -> assertFailure ("loadGraph failed: " <> err)
@@ -108,15 +116,15 @@ testQueries :: SqlBackend db => IO db -> (db -> IO ()) -> Test
 testQueries openDb closeDb = TestCase $ do
   db <- openDb
   (eg, eidAdd, eidP2, _) <- buildGraph
-  _ <- saveGraph db eg
-  tn2 <- Q.topN db 2
+  _ <- saveGraphTest db eg
+  tn2 <- Q.topN db 1 2
   case tn2 of
     (x : _) -> assertEqual "topN[0]" (eidAdd, 0.9) x
     []      -> assertFailure "topN returned no rows"
   assertEqual "topN length" 2 (length tn2)
-  tn1 <- Q.topN db 1
+  tn1 <- Q.topN db 1 1
   assertEqual "topN(1)" [(eidAdd, 0.9)] tn1
-  dc <- Q.distributionCounts db 100
+  dc <- Q.distributionCounts db 1 100
   assertEqual "distribution totals evaluated classes" (numEvaluated eg) (sum (map snd dc))
   cAdd <- Q.countPattern db "EAdd"
   assertEqual "EAdd classes" 1 cAdd
@@ -124,10 +132,10 @@ testQueries openDb closeDb = TestCase $ do
   assertEqual "EMul classes" 2 cMul
   -- pareto over (max fitness, min dl): give add (fit 0.9, dl 1.0) which
   -- dominates p2 (0.7, 2.0) and p3 (0.5, 3.0), so only add remains.
-  execDb db ("UPDATE fit SET dl = 1.0 WHERE eid = " <> T.pack (show eidAdd))
-  execDb db ("UPDATE fit SET dl = 2.0 WHERE eid = " <> T.pack (show eidP2))
-  execDb db ("UPDATE fit SET dl = 3.0 WHERE eid NOT IN (" <> T.pack (show eidAdd) <> "," <> T.pack (show eidP2) <> ")")
-  p <- Q.pareto db
+  execDb db ("UPDATE dataset_fit SET dl = 1.0 WHERE eid = " <> T.pack (show eidAdd))
+  execDb db ("UPDATE dataset_fit SET dl = 2.0 WHERE eid = " <> T.pack (show eidP2))
+  execDb db ("UPDATE dataset_fit SET dl = 3.0 WHERE eid NOT IN (" <> T.pack (show eidAdd) <> "," <> T.pack (show eidP2) <> ")")
+  p <- Q.pareto db 1
   assertEqual "pareto keeps only add" [(eidAdd, 0.9, 1.0)] p
   closeDb db
 
@@ -135,18 +143,20 @@ testSync :: SqlBackend db => IO db -> (db -> IO ()) -> Test
 testSync openDb closeDb = TestCase $ do
   db <- openDb
   (eg, eidAdd, _, _) <- buildGraph
-  _ <- saveGraph db eg
+  _ <- saveGraphTest db eg
 
   -- refit in memory, push to DB
   let egNew = runIdentity $ execStateT (insertFitness eidAdd 0.99 []) eg
-  pushFit db egNew
-  Right eg3 <- refreshFitness db eg
+  pushFit db 1 egNew
+  Right eg3 <- refreshFitness db 1 eg
   assertEqual "pushed fitness read back" (Just 0.99) (evalIn eg3 (getFitness eidAdd))
   assertEqual "graph class count intact" (IntMap.size (_eClass eg)) (IntMap.size (_eClass eg3))
 
-  -- edit fitness straight in the DB, refresh pulls it in
+  -- edit fitness straight in the DB, refresh pulls it in. refreshFitness reads
+  -- dataset_fit; the legacy loadGraph reads fit (kept for the test loader).
+  execDb db ("UPDATE dataset_fit SET fitness = 0.55 WHERE eid = " <> T.pack (show eidAdd))
   execDb db ("UPDATE fit SET fitness = 0.55 WHERE eid = " <> T.pack (show eidAdd))
-  Right eg4 <- refreshFitness db eg
+  Right eg4 <- refreshFitness db 1 eg
   assertEqual "db edit pulled in" (Just 0.55) (evalIn eg4 (getFitness eidAdd))
 
   -- a stored graph loads with the current DB fitness
@@ -170,7 +180,7 @@ testParents :: SqlBackend db => IO db -> (db -> IO ()) -> Test
 testParents openDb closeDb = TestCase $ do
   db <- openDb
   (eg, _, _, _) <- buildGraph
-  _ <- saveGraph db eg
+  _ <- saveGraphTest db eg
   let expected = sum
         [ Set.size (_parents ec)
         | (_, ec) <- IntMap.toList (_eClass eg) ]
@@ -243,7 +253,7 @@ testPagedRoundtrip :: SqlBackend db => IO db -> (db -> IO ()) -> Test
 testPagedRoundtrip openDb closeDb = TestCase $ do
   db <- openDb
   (eg, eidAdd, _, eidP3) <- buildGraph
-  _ <- saveGraph db eg
+  _ <- saveGraphTest db eg
   pc <- query db "SELECT COUNT(*) FROM cstore_page" []
   let expected = IntMap.size (_eClass eg)
   case pc of
@@ -272,7 +282,7 @@ testPagedMutatePersist :: SqlBackend db => IO db -> (db -> IO ()) -> Test
 testPagedMutatePersist openDb closeDb = TestCase $ do
   db <- openDb
   (eg, eidAdd, _, _) <- buildGraph
-  _ <- saveGraph db eg
+  _ <- saveGraphTest db eg
   Right eg0 <- loadGraph db
   (eidNew, eg1) <- runIOIn eg0 $ do
     cid <- fromTree myCost (var 0 + var 2)
@@ -282,7 +292,7 @@ testPagedMutatePersist openDb closeDb = TestCase $ do
     pure cid
   -- (x0+x2) was not present, so a brand new class was created
   assertBool "new class is distinct" (eidNew /= eidAdd)
-  _ <- saveGraph db eg1
+  _ <- saveGraphTest db eg1
   Right eg2 <- loadGraph db
   assertEqual "new class fitness persisted" (Just 0.33) (evalIn eg2 (getFitness eidNew))
   assertEqual "old class intact" (Just 0.9) (evalIn eg2 (getFitness eidAdd))
@@ -295,7 +305,7 @@ testPagedFallback :: SqlBackend db => IO db -> (db -> IO ()) -> Test
 testPagedFallback openDb closeDb = TestCase $ do
   db <- openDb
   (eg, eidAdd, _, _) <- buildGraph
-  _ <- saveGraph db eg
+  _ <- saveGraphTest db eg
   execDb db "DELETE FROM cstore_page"
   m <- loadGraph db
   case m of
@@ -313,8 +323,8 @@ testLazyLoad :: SqlBackend db => IO db -> (db -> IO ()) -> Test
 testLazyLoad openDb closeDb = TestCase $ do
   db <- openDb
   (eg, eidAdd, eidP2, _) <- buildGraph
-  _ <- saveGraph db eg
-  obj <- loadGraphLazy db
+  _ <- saveGraphTest db eg
+  obj <- loadGraphLazy db 1
   case obj of
     Left err -> assertFailure ("loadGraphLazy failed: " <> err)
     Right eg' -> do
@@ -342,7 +352,7 @@ testLazyLoad openDb closeDb = TestCase $ do
         st <- get
         liftIO (flushStore st)
         pure cid
-      _ <- saveGraph db eg2
+      _ <- saveGraphTest db eg2
       Right eg3 <- loadGraph db
       assertEqual "lazy mutate: new class persisted" (Just 0.11) (evalIn eg3 (getFitness eidNew))
       assertEqual "lazy mutate: old class intact" (Just 0.9) (evalIn eg3 (getFitness eidAdd))
@@ -361,8 +371,8 @@ testLazyRewrite openDb closeDb = TestCase $ do
         _ <- fromTree myCost (1 ** var 1)
         _ <- fromTree myCost (var 0 / var 0)
         pure ()
-  _ <- saveGraph db eg
-  obj <- loadGraphLazy db
+  _ <- saveGraphTest db eg
+  obj <- loadGraphLazy db 1
   case obj of
     Left err -> assertFailure ("loadGraphLazy failed: " <> err)
     Right eg' -> do
