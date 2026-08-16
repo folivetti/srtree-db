@@ -132,29 +132,42 @@ run = runDb
 -- Every canonical e-class is written as a serialized page to @cstore_page@ in
 -- addition to the normalized relational schema, so the graph round-trips
 -- through the lazily paged 'loadGraph' as well as the relational path.
+--
+-- On a paged graph the page store and the write-through-maintained relational
+-- tables are already the authoritative live graph ('cpsInsert' writes every
+-- class body, 'cpsRecordNode'/'cpsRecordCanonical' keep the structure tables
+-- current), so 'saveGraph' only refreshes the @meta@ scalars. This avoids
+-- materializing every page ('cpsAll') in RAM -- the O(n) spike that dominated
+-- out-of-core persistence -- and never rebuilds the canonical/node tables from
+-- the (bounded, partial) resident caches.
 saveGraph :: SqlBackend db => db -> Int -> EGraph -> IO (Either String ())
 saveGraph db dsid eg = do
   createSchema db
   let rows0 = exportEGraph eg
-  gr <- graphClassRows eg
-  let rows = rows0 { _grEClasses = gr }
-  execDb db "BEGIN"
-  result <- (do
-      clearTables db
-      writeMeta db rows
-      writeNodes db rows
-      writeClasses db rows
-      writeParents db rows
-      writeFit db rows
-      writeDatasetFitRows db dsid rows
-      writeClassPages db rows
-      execDb db "COMMIT"
-      pure (Right ()))
-    `catch` \(e :: SomeException) -> do
-      -- roll back so a partial write never leaves the connection mid-transaction
-      execDb db "ROLLBACK"
-      pure (Left ("saveGraph failed: " <> displayException e))
-  pure result
+  case _classStore eg of
+    Just _  -> commitWith $ do
+      writeMeta db rows0
+    Nothing -> do
+      gr <- graphClassRows eg
+      let rows = rows0 { _grEClasses = gr }
+      commitWith $ do
+        clearTables db
+        writeMeta db rows
+        writeNodes db rows
+        writeClasses db rows
+        writeParents db rows
+        writeFit db rows
+        writeDatasetFitRows db dsid rows
+        writeClassPages db rows
+  where
+    commitWith writes = do
+      execDb db "BEGIN"
+      result <- (writes >> execDb db "COMMIT" >> pure (Right ()))
+        `catch` \(e :: SomeException) -> do
+          -- roll back so a partial write never leaves the connection mid-transaction
+          execDb db "ROLLBACK"
+          pure (Left ("saveGraph failed: " <> displayException e))
+      pure result
 
 -- | Enumerate every canonical e-class row of a graph. For a paged graph the
 -- resident @_eClass@ is a bounded cache that may hold classes created or mutated
@@ -400,26 +413,35 @@ seedEDBPaged nextId trackDBs _nodeToEClass =
 -- This bounds peak memory (the whole class set is never resident at once).
 -- Use it with 'MonadIO'-based ('ClassStore') operations; the pure instances
 -- expect a complete resident map and are not suitable for a lazy graph.
+--
+-- On the paged path the resident @_canonicalMap@/@_eNodeToEClass@ start EMPTY
+-- (bounded caches): canonical/node lookups fall back to the live relational
+-- tables ('cpsCanonicalOf'/'cpsNodeToClass'), which the write-through keeps
+-- current, so nothing O(nodes) is materialized at load.
 loadGraphLazy :: SqlBackend db => db -> Int -> IO (Either String EGraph)
 loadGraphLazy db dsid = do
   m <- readMeta db
   case m of
     Nothing -> pure (Left "srtree-db: no e-graph stored in this database")
     Just (nextId, trackDBs) -> do
-      enodes <- readNodes db
-      ecLst  <- readClasses db
       dsFit  <- readDatasetFit db dsid
-      let canon0  = IntMap.fromList [ (eid, c) | (eid, c, _) <- ecLst ]
-          rep eid = IntMap.findWithDefault eid eid canon0
-          nodeToEClass0 = HashMap.fromList enodes
-          nodeToEClass  = HashMap.map rep nodeToEClass0
-          fitMap = IntMap.fromList [ (eid, (f, d, sz, parseTheta (T.unpack th)))
+      let fitMap = IntMap.fromList [ (eid, (f, d, sz, parseTheta (T.unpack th)))
                                    | (eid, (f, d, sz, th)) <- dsFit ]
+          -- slim (no theta) map for the out-of-core path: the eqsat matcher's
+          -- conditions read only class _consts, never theta, so attaching it on
+          -- every page read would retain O(#classes) target vectors in RAM.
+          fitSlim = IntMap.map (\(f, d, sz, _) -> (f, d, sz)) fitMap
       ps <- openClassStore db defaultClassCap 1000
-      pages <- allPages ps
-      if null pages
+      hasPages <- storeHasPages db
+      if not hasPages
         then do
           -- fully relational fallback (databases written before the page store)
+          enodes <- readNodes db
+          ecLst  <- readClasses db
+          let canon0  = IntMap.fromList [ (eid, c) | (eid, c, _) <- ecLst ]
+              rep eid = IntMap.findWithDefault eid eid canon0
+              nodeToEClass0 = HashMap.fromList enodes
+              nodeToEClass  = HashMap.map rep nodeToEClass0
           parents <- readParents db
           let storedParents = IntMap.fromListWith Set.union
                 [ (c, Set.singleton (pEid, pEn))
@@ -429,28 +451,36 @@ loadGraphLazy db dsid = do
               rows    = GraphRows canon0 nodeToEClass classes nextId trackDBs
           pure (importEGraph rows)
         else do
-          -- lazily paged: empty resident map + store handle + seeded DBs.
-          -- Use the minimal seed (pattern DB only, no size/fitness/DL range DBs):
-          -- runEqSat only reads _patDB; the range DBs are in-memory query
-          -- structures, so building them here wastes O(#classes) memory.
-          -- Fitness is dataset metadata, applied on page reads (not baked into
-          -- the structural page blobs).
+          -- lazily paged: empty resident maps (canonical / node -> class start
+          -- as bounded caches backed by the live relational tables), a store
+          -- handle, and no pattern trie / range DBs. Fitness is dataset
+          -- metadata, applied on page reads (not baked into the pages).
           let base = classStoreHandle ps
               h    = base { cpsLookup = \eid ->
-                              fmap (fmap (applyDsFit fitMap eid)) (cpsLookup base eid) }
-              eDB  = seedEDBPaged nextId trackDBs nodeToEClass
-              eg   = EGraph canon0 nodeToEClass IntMap.empty eDB (Just h)
+                              fmap (fmap (applyDsFit fitSlim eid)) (cpsLookup base eid) }
+              eDB  = seedEDBPaged nextId trackDBs HashMap.empty
+              eg   = EGraph IntMap.empty HashMap.empty IntMap.empty eDB (Just h)
           pure (Right eg)
 
 -- | Apply a dataset's fitness metadata to a class read from the structural page
--- store (fitness/dl/theta/size are dataset-specific, so they are attached on
--- read rather than stored in the page blob).
+-- store (fitness/dl/size are dataset-specific, so they are attached on read
+-- rather than stored in the page blob). Theta is deliberately NOT attached on
+-- the out-of-core path: the eqsat matcher's conditions read only @_consts@, so
+-- keeping the per-class @[Target]@ vectors out of the resident read path avoids
+-- O(#classes) memory; theta stays in @dataset_fit@ for the query path.
 applyDsFit
-  :: IntMap.IntMap (Maybe Double, Maybe Double, Int, [Target])
+  :: IntMap.IntMap (Maybe Double, Maybe Double, Int)
   -> EClassId -> EClass -> EClass
 applyDsFit m eid ec = case IntMap.lookup eid m of
   Nothing -> ec
-  Just (f, dl, sz, th) -> ec { _info = (_info ec) { _fitness = f, _dl = dl, _size = sz, _theta = th } }
+  Just (f, dl, sz) -> ec { _info = (_info ec) { _fitness = f, _dl = dl, _size = sz } }
+
+-- | Cheap emptiness test for the page store (avoids materializing every page
+-- blob just to pick the relational vs paged load path).
+storeHasPages :: SqlBackend db => db -> IO Bool
+storeHasPages db = do
+  rows <- query db ("SELECT 1 FROM " <> classStoreTable <> " LIMIT 1") []
+  pure (not (null rows))
 
 readMeta :: SqlBackend db => db -> IO (Maybe (Int, Bool))
 readMeta db = do

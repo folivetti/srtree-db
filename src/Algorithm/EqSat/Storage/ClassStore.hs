@@ -145,6 +145,7 @@ data PageStore db = PageStore
   , psTable     :: !T.Text
   , psCache     :: !(IORef PageCache)
   , psNodes     :: !(IORef (Set.HashSet (Int, ENode))) -- newly-created nodes awaiting write-back
+  , psCanon     :: !(IORef (IM.IntMap Int))            -- pending canonical (eid -> representative) rows
   , psCap       :: !Int
   , psFlushEvery :: !Int
   }
@@ -161,7 +162,8 @@ newPageStore db tbl cap flushEvery' = do
      " (key TEXT PRIMARY KEY, blob TEXT NOT NULL)")
   cache <- newIORef (emptyCache cap)
   nodes <- newIORef Set.empty
-  pure (PageStore db tbl cache nodes cap flushEvery')
+  canons <- newIORef IM.empty
+  pure (PageStore db tbl cache nodes canons cap flushEvery')
 
 -- | Read the page for @eid@ (cache miss loads from the database). Refreshes
 -- LRU recency on hit so hot classes stay resident.
@@ -228,6 +230,7 @@ writeback ps = do
     execDb db "COMMIT"
     modifyIORef' (psCache ps) (\cc -> cc { pcPend = IM.empty, pcPendN = 0 })
   flushNodes ps
+  flushCanon ps
   pure (length pend)
 
 -- | Flush any newly-created nodes recorded via 'cpsRecordNode' into the
@@ -250,6 +253,24 @@ flushNodes ps = do
         [ SqlInteger (fromIntegral eid), SqlText key ]
     execDb db "COMMIT"
     modifyIORef' (psNodes ps) (const Set.empty)
+
+-- | Flush any pending canonical rows (recorded via 'cpsRecordCanonical') into
+-- @eclass.canonical@ (idempotent upsert), so the streaming canonical lookup
+-- ('cpsCanonicalOf') reflects merges and new classes. Runs in its own
+-- transaction.
+flushCanon :: SqlBackend db => PageStore db -> IO ()
+flushCanon ps = do
+  canons <- readIORef (psCanon ps)
+  unless (IM.null canons) $ do
+    let db = psDb ps
+    execDb db "BEGIN"
+    forM_ (IM.toList canons) $ \(eid, canon) ->
+      runDb db ("INSERT INTO eclass (eid, canonical, height) VALUES (?, ?, 0) "
+                <> "ON CONFLICT(eid) DO UPDATE SET canonical=excluded.canonical")
+        [ SqlInteger (fromIntegral eid)
+        , SqlInteger (fromIntegral canon) ]
+    execDb db "COMMIT"
+    writeIORef (psCanon ps) IM.empty
 
 -- | Number of dirty pages not yet written back.
 pendingCount :: PageStore db -> IO Int
@@ -317,4 +338,24 @@ classStoreHandle ps = EClassPageStore
                             , not (IntSet.member eid ex) ]
       pure (take budget (nub (pendRoots ++ dbRoots)))
   , cpsRecordNode  = \en eid -> modifyIORef' (psNodes ps) (Set.insert (eid, en))
+  , cpsNodeToClass = \en -> do
+      -- content-address lookup, seeing not-yet-flushed nodes first (live)
+      pend <- readIORef (psNodes ps)
+      case [ eid | (eid, pe) <- Set.toList pend, pe == en ] of
+        (eid : _) -> pure (Just eid)
+        [] -> do
+          rows <- queryDb (psDb ps)
+            "SELECT eid FROM eclass_node WHERE enode_key = ?"
+            [SqlText (T.pack (enodeKey en))]
+          pure (case rows of [[v]] -> Just (sqlToInt v); _ -> Nothing)
+  , cpsCanonicalOf = \eid -> do
+      pend <- readIORef (psCanon ps)
+      case IM.lookup eid pend of
+        Just c  -> pure (Just c)
+        Nothing -> do
+          rows <- queryDb (psDb ps)
+            "SELECT canonical FROM eclass WHERE eid = ?"
+            [SqlInteger (fromIntegral eid)]
+          pure (case rows of [[v]] -> Just (sqlToInt v); _ -> Nothing)
+  , cpsRecordCanonical = \eid canon -> modifyIORef' (psCanon ps) (IM.insert eid canon)
   }
