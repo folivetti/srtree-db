@@ -510,6 +510,46 @@ testFrontierReload openDb closeDb = TestCase $ do
         assertBool "frontier cleared after pass" (null fr)
   closeDb db
 
+-- | Equivalence of the pure in-memory eqsat and the paged DB eqsat: running the
+-- same expressions through both must produce the same merge structure (which
+-- classes collapse into one). e-class ids differ between the two graphs, so we
+-- compare the *relative* structure -- A/B merge and are distinct from C/D -- in
+-- each mode independently. This guards the "both options" guarantee: the DB
+-- work didn't change in-memory saturation quality, and vice-versa.
+testEquivInMemDB :: SqlBackend db => IO db -> (db -> IO ()) -> Test
+testEquivInMemDB openDb closeDb = TestCase $ do
+  db <- openDb
+  let ((eidA, eidB, eidC, eidD), eg) = runIn emptyGraph $ do
+        eidA <- fromTree myCost (var 0 * var 0)   -- mergeable pair #1
+        eidB <- fromTree myCost (var 0 ** 2)
+        eidC <- fromTree myCost (var 1 * var 1)   -- mergeable pair #2
+        eidD <- fromTree myCost (var 1 ** 2)
+        pure (eidA, eidB, eidC, eidD)
+  -- --- in-memory path (pure Identity graph) ---
+  let (_, egMem) = runIn eg (runEqSat myCost rewrites 20)
+      (mA, _) = runIn egMem (canonical eidA)
+      (mB, _) = runIn egMem (canonical eidB)
+      (mC, _) = runIn egMem (canonical eidC)
+      (mD, _) = runIn egMem (canonical eidD)
+  assertEqual "in-mem: pair1 merged" mA mB
+  assertEqual "in-mem: pair2 merged" mC mD
+  assertBool   "in-mem: pairs distinct" (mA /= mC)
+  -- --- DB/paged path ---
+  _ <- saveGraphTest db eg
+  obj <- loadGraphLazy db 1
+  case obj of
+    Left err -> assertFailure ("loadGraphLazy failed: " <> err)
+    Right eg0 -> do
+      (_, egDB) <- runIOIn eg0 (runEqSat myCost rewrites 20)
+      (dA, _) <- runIOIn egDB (canonical eidA)
+      (dB, _) <- runIOIn egDB (canonical eidB)
+      (dC, _) <- runIOIn egDB (canonical eidC)
+      (dD, _) <- runIOIn egDB (canonical eidD)
+      assertEqual "DB: pair1 merged" dA dB
+      assertEqual "DB: pair2 merged" dC dD
+      assertBool   "DB: pairs distinct" (dA /= dC)
+  closeDb db
+
 runPagedSuite :: SqlBackend db => String -> (IO db, db -> IO ()) -> [Test]
 runPagedSuite tag (openDb, closeDb) =
   [ TestLabel (tag <> " paged-roundtrip")   (testPagedRoundtrip openDb closeDb)
@@ -520,6 +560,7 @@ runPagedSuite tag (openDb, closeDb) =
   , TestLabel (tag <> " paged-push-fit")    (testPagedPushFit openDb closeDb)
   , TestLabel (tag <> " paged-eqsat-reload") (testPagedEqSatReload openDb closeDb)
   , TestLabel (tag <> " frontier")          (testFrontierReload openDb closeDb)
+  , TestLabel (tag <> " equiv-inmem-db")    (testEquivInMemDB openDb closeDb)
   ]
 
 runSuite :: SqlBackend db => String -> (IO db, db -> IO ()) -> [Test]

@@ -23,6 +23,7 @@
 module Algorithm.EqSat.Storage.Import
   ( ImportSummary(..)
   , importEqs
+  , recordExpressionIndex
   ) where
 
 import Control.Monad (forM, forM_, foldM)
@@ -237,6 +238,20 @@ lookupClassNode db eid = do
   pure $ case rows of
     ([SqlText k] : _) -> parseEnodeKey (T.unpack k)
     _                 -> Nothing
+
+-- | Record that an expression (by its canonical root e-node) was seen in a
+-- dataset's graph, so "was this expression already tested?" is answerable per
+-- dataset. Used by the delta-insert path ('dbInsert') to keep @expression_index@
+-- live for newly-added expressions.
+recordExpressionIndex :: SqlBackend db => db -> Int -> EClassId -> IO ()
+recordExpressionIndex db dsid eid = do
+  mroot <- lookupClassNode db eid
+  forM_ mroot $ \en ->
+    runDb db
+      "INSERT OR REPLACE INTO expression_index (expression_key, eclass, dataset_id) VALUES (?, ?, ?)"
+      [ SqlText (T.pack (enodeKey en))
+      , SqlInteger (fromIntegral eid)
+      , SqlInteger (fromIntegral dsid) ]
 
 -- | Write every class page once, reconstructing each class from the relational
 -- tables (node + height from @eclass_node@/@eclass@, parents from @parent@,
