@@ -13,6 +13,14 @@ author:        Fabricio Olivetti de França
 maintainer:    fabricio.olivetti@gmail.com
 category:      Math, Data
 build-type:    Simple
+homepage:      https://github.com/folivetti/srtree-db#readme
+bug-reports:   https://github.com/folivetti/srtree-db/issues
+extra-source-files:
+  ChangeLog.md
+
+source-repository head
+  type:     git
+  location: https://github.com/folivetti/srtree-db
 
 library
   hs-source-dirs:   src
@@ -35,7 +43,7 @@ library
     , text
     , direct-sqlite
     , postgresql-libpq
-    , srtree
+    , srtree >= 3.0.0.0
     , vector
     , mtl
   default-language: Haskell2010
