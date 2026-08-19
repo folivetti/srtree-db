@@ -223,9 +223,9 @@ writeClassPages db rows =
 
 writeMeta :: SqlBackend db => db -> GraphRows -> IO ()
 writeMeta db rows = do
-  run db "INSERT INTO meta (key, value) VALUES (?, ?)"
+  run db "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)"
     [ SqlText "next_id", SqlText (T.pack (show (_grNextId rows))) ]
-  run db "INSERT INTO meta (key, value) VALUES (?, ?)"
+  run db "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)"
     [ SqlText "track_dbs", SqlText (if _grTrackDBs rows then "1" else "0") ]
 
 writeNodes :: SqlBackend db => db -> GraphRows -> IO ()

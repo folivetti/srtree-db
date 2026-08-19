@@ -36,16 +36,16 @@ library
     Algorithm.EqSat.Storage.Query
   build-depends:
       base >=4.14 && <5
-    , bytestring
-    , binary
-    , containers
-    , unordered-containers
-    , text
-    , direct-sqlite
-    , postgresql-libpq
-    , srtree >= 3.0.0.0
-    , vector
-    , mtl
+    , bytestring >=0.10 && <0.13
+    , binary >=0.8 && <0.9
+    , containers >=0.6 && <0.9
+    , unordered-containers >=0.2 && <0.3
+    , text >=1.2 && <2.2
+    , direct-sqlite >=2.3 && <2.4
+    , postgresql-libpq >=0.10 && <0.12
+    , srtree >=3.0.0.2 && <3.1
+    , vector >=0.12 && <0.14
+    , mtl >=2.2 && <2.4
   default-language: Haskell2010
 
 benchmark srtree-db-bench
@@ -54,16 +54,37 @@ benchmark srtree-db-bench
   hs-source-dirs:   bench
   ghc-options:      -O2
   build-depends:
-      base
-    , bytestring
-    , containers
-    , text
-    , time
-    , directory
-    , direct-sqlite
-    , postgresql-libpq
-    , srtree
-    , srtree-db
+      base >=4.14 && <5
+    , bytestring >=0.10 && <0.13
+    , containers >=0.6 && <0.9
+    , text >=1.2 && <2.2
+    , time >=1.10 && <1.15
+    , directory >=1.3 && <1.4
+    , direct-sqlite >=2.3 && <2.4
+    , postgresql-libpq >=0.10 && <0.12
+    , srtree >=3.0 && <3.1
+    , srtree-db >=0.1 && <0.2
+  default-language: Haskell2010
+
+executable srtree-db
+  hs-source-dirs:   app
+  main-is:          Main.hs
+  other-modules:    Ingest, EqSat, FitData
+  ghc-options:      -O2 -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      base >=4.14 && <5
+    , optparse-applicative >=0.17 && <0.19
+    , srtree-db >=0.1 && <0.2
+    , srtree >=3.0 && <3.1
+    , bytestring >=0.10 && <0.13
+    , containers >=0.6 && <0.9
+    , text >=1.2 && <2.2
+    , vector >=0.12 && <0.14
+    , directory >=1.3 && <1.4
+    , filepath >=1.4 && <1.5
+    , direct-sqlite >=2.3 && <2.4
+    , random >=1.2 && <1.3
+    , mtl >=2.2 && <2.4
   default-language: Haskell2010
 
 test-suite srtree-db-test
@@ -71,18 +92,18 @@ test-suite srtree-db-test
   main-is:          Main.hs
   hs-source-dirs:   test
   build-depends:
-      base
-    , HUnit
-    , bytestring
-    , binary
-    , containers
-    , directory
-    , unordered-containers
-    , text
-    , direct-sqlite
-    , postgresql-libpq
-    , srtree
-    , srtree-db
-    , vector
-    , mtl
+      base >=4.14 && <5
+    , HUnit >=1.6 && <1.7
+    , bytestring >=0.10 && <0.13
+    , binary >=0.8 && <0.9
+    , containers >=0.6 && <0.9
+    , directory >=1.3 && <1.4
+    , unordered-containers >=0.2 && <0.3
+    , text >=1.2 && <2.2
+    , direct-sqlite >=2.3 && <2.4
+    , postgresql-libpq >=0.10 && <0.12
+    , srtree >=3.0 && <3.1
+    , srtree-db >=0.1 && <0.2
+    , vector >=0.12 && <0.14
+    , mtl >=2.2 && <2.4
   default-language: Haskell2010
