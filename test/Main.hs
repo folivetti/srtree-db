@@ -44,6 +44,7 @@ myCost :: SRTree Int -> Int
 myCost (Var _)     = 1
 myCost (Const _)   = 1
 myCost (Param _)   = 1
+myCost (Y _)       = 1
 myCost (Bin _ l r) = 2 + l + r
 myCost (Uni _ t)   = 3 + t
 
@@ -171,28 +172,6 @@ pgOpen dsn = connectdb (TE.encodeUtf8 (T.pack dsn))
 
 mkPage :: Int -> BS.ByteString
 mkPage i = BS.replicate (10 + i) (fromIntegral i)
-
--- | The @parent@ table round-trips every reverse edge: the row count matches
--- the live graph's total @_parents@ entries, and a reload reconstructs the
--- identical per-class parent sets.
-testParents :: SqlBackend db => IO db -> (db -> IO ()) -> Test
-testParents openDb closeDb = TestCase $ do
-  db <- openDb
-  (eg, _, _, _) <- buildGraph
-  _ <- saveGraphTest db eg
-  let expected = sum
-        [ Set.size (_parents ec)
-        | (_, ec) <- IntMap.toList (_eClass eg) ]
-  rows <- query db "SELECT COUNT(*) FROM parent" []
-  case rows of
-    [[SqlInteger n]] -> assertEqual "parent row count" expected (fromIntegral n)
-    [[SqlText t]]    -> assertEqual "parent row count" expected
-                          (read (T.unpack t) :: Int)
-    _                -> assertFailure "parent count: unexpected row shape"
-  Right eg' <- loadGraph db
-  let parentsMap g = IntMap.map _parents (_eClass g)
-  assertEqual "parents preserved per class" (parentsMap eg) (parentsMap eg')
-  closeDb db
 
 testStoreRoundtrip :: SqlBackend db => IO db -> (db -> IO ()) -> Test
 testStoreRoundtrip openDb closeDb = TestCase $ do
@@ -566,7 +545,6 @@ runPagedSuite tag (openDb, closeDb) =
 runSuite :: SqlBackend db => String -> (IO db, db -> IO ()) -> [Test]
 runSuite tag (openDb, closeDb) =
   [ TestLabel (tag <> " save-load-roundtrip") (testSaveLoadRT openDb closeDb)
-  , TestLabel (tag <> " parents")             (testParents openDb closeDb)
   , TestLabel (tag <> " queries")             (testQueries openDb closeDb)
   , TestLabel (tag <> " sync")                (testSync openDb closeDb)
   ]

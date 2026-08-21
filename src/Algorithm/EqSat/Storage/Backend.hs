@@ -22,13 +22,16 @@ module Algorithm.EqSat.Storage.Backend
   , sqlToInt
   , sqlToMaybeDouble
   , sqlToText
+  , sqlToBlob
   ) where
 
 import Data.Int (Int64)
 import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BL
 
 import Algorithm.EqSat.Egraph (EClassId)
 
@@ -36,6 +39,7 @@ import Algorithm.EqSat.Egraph (EClassId)
 data SqlValue = SqlInteger Int64
               | SqlFloat   Double
               | SqlText    Text
+              | SqlBlob    BS.ByteString
               | SqlNull
   deriving (Eq, Show)
 
@@ -88,4 +92,10 @@ sqlToText :: SqlValue -> Text
 sqlToText (SqlText t)    = t
 sqlToText (SqlInteger n) = T.pack (show n)
 sqlToText (SqlFloat d)   = T.pack (show d)
+sqlToText (SqlBlob bs)   = TE.decodeUtf8 bs
 sqlToText SqlNull        = ""
+
+sqlToBlob :: SqlValue -> BS.ByteString
+sqlToBlob (SqlBlob bs) = bs
+sqlToBlob (SqlText t)  = TE.encodeUtf8 t
+sqlToBlob _            = BS.empty

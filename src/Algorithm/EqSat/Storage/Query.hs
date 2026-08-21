@@ -73,10 +73,12 @@ writeDatasetFit db ds eid fit dl theta sz = do
       (dlCol, dlVal) = case dl of
         Nothing -> ("NULL", Nothing)
         Just d  -> ("?", Just (SqlFloat d))
+      isFitted = case fit of { Nothing -> 0; Just _ -> 1 }
+      isEvaluated = case fit of { Nothing -> 0; Just _ -> 1 }
   runDb db
     ("INSERT OR REPLACE INTO dataset_fit \
      \(dataset_id, eid, fitness, dl, theta, size, evaluated, fitted) \
-     \VALUES (?, ?, " <> fitCol <> ", " <> dlCol <> ", ?, ?, 1, 1)")
+     \VALUES (?, ?, " <> fitCol <> ", " <> dlCol <> ", ?, ?, " <> T.pack (show isEvaluated) <> ", " <> T.pack (show isFitted) <> ")")
     (catMaybes [ Just (SqlInteger (fromIntegral ds))
                , Just (SqlInteger (fromIntegral eid))
                , fitVal

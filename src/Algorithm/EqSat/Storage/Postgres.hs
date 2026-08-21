@@ -19,6 +19,7 @@ module Algorithm.EqSat.Storage.Postgres
 
 import Control.Monad (forM, forM_)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import qualified Data.IntSet as IntSet
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -29,7 +30,6 @@ import Database.PostgreSQL.LibPQ
   , ntuples, resultErrorMessage, resultStatus, toColumn, toRow )
 
 import Algorithm.EqSat.Storage.Backend (SqlValue(..), SqlBackend(..), sqlToInt, sqlToText)
-import Algorithm.EqSat.Storage.ClassStore (unhex)
 
 -- | PostgreSQL DDL. Mirrors 'Algorithm.EqSat.Storage.Schema.schemaSQL'.
 --
@@ -62,14 +62,9 @@ schemaPostgres =
     <> " eid BIGINT NOT NULL REFERENCES eclass(eid) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,"
     <> " enode_key TEXT NOT NULL REFERENCES enode(key) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,"
     <> " PRIMARY KEY (eid, enode_key))"
-  , "CREATE TABLE IF NOT EXISTS parent ("
-    <> " child_eid BIGINT NOT NULL REFERENCES eclass(eid) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,"
-    <> " parent_eid BIGINT NOT NULL,"
-    <> " parent_enode_key TEXT NOT NULL REFERENCES enode(key) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,"
-    <> " PRIMARY KEY (child_eid, parent_eid, parent_enode_key))"
   , "CREATE TABLE IF NOT EXISTS cstore_page ("
-    <> " key TEXT PRIMARY KEY,"
-    <> " blob TEXT NOT NULL)"
+    <> " key BIGINT PRIMARY KEY,"
+    <> " blob BYTEA NOT NULL)"
   , "CREATE TABLE IF NOT EXISTS frontier ("
     <> " eid BIGINT PRIMARY KEY REFERENCES eclass(eid) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,"
     <> " updated_at TEXT)"
@@ -156,7 +151,11 @@ instance SqlBackend Connection where
   -- out-of-core target).
   streamPages conn tbl k = do
     rows <- queryDb conn ("SELECT key, blob FROM " <> tbl) []
-    forM_ rows $ \[key, blob] -> k (fromIntegral (sqlToInt key)) (unhex (sqlToText blob))
+    forM_ rows $ \[key, blob] ->
+      -- Postgres bytea returns hex-encoded text with \x prefix in text protocol
+      let raw = sqlToText blob
+          hexStr = if T.isPrefixOf "\\x" raw then T.drop 2 raw else raw
+      in k (fromIntegral (sqlToInt key)) (unhex hexStr)
 
 -- | Raise an exception unless the status is @CommandOk@/@TuplesOk@.
 statusOK :: Result -> Text -> IO ()
@@ -195,6 +194,7 @@ renderParam :: SqlValue -> Maybe (Oid, ByteString, Format)
 renderParam (SqlInteger n) = Just (invalidOid, TE.encodeUtf8 (T.pack (show n)), Text)
 renderParam (SqlFloat d)   = Just (invalidOid, TE.encodeUtf8 (T.pack (show d)), Text)
 renderParam (SqlText t)    = Just (invalidOid, TE.encodeUtf8 t, Text)
+renderParam (SqlBlob bs)   = Just (invalidOid, TE.encodeUtf8 (T.pack (show bs)), Text)
 renderParam SqlNull        = Nothing
 
 -- | Rewrite the shared positional @?@ placeholders to libpq's @$n@ form
@@ -211,3 +211,13 @@ toPG = T.pack . go (1 :: Int) . T.unpack
         skip []          = []
     go n ('?' : r)    = '$' : show n ++ go (n + 1) r
     go n (c : r)      = c : go n r
+
+-- | Decode a hex string to a ByteString (local copy; Postgres bytea returns
+-- hex-encoded text in the text protocol).
+unhex :: Text -> ByteString
+unhex = BS.pack . go . T.unpack
+  where
+    go (a:b:r) = fromIntegral (hexv a * 16 + hexv b) : go r
+    go _       = []
+    hexv c | c >= '0' && c <= '9' = fromEnum c - fromEnum '0'
+           | otherwise            = fromEnum c - fromEnum 'a' + 10

@@ -10,7 +10,7 @@ Two layers:
 
 - **Serialization / queries** (`Storage/`): `Schema.hs` defines a normalized
   schema (`meta`, `enode`, `enode_child`, `eclass`, `eclass_node`, `parent`,
-  `fit`) plus a `cstore_page` key-value table. `SQLite.hs` / `Postgres.hs`
+  `dataset_fit`) plus a `cstore_page` key-value table. `SQLite.hs` / `Postgres.hs`
   provide the concrete `SqlBackend` instances and the public API
   (`saveGraph`, `loadGraph`, `loadGraphLazy`, `pushFit`, `refreshFitness`,
   `flushStore`). `Query.hs` is the SQL query API (`topN`, `pareto`,

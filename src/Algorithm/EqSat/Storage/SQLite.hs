@@ -25,6 +25,7 @@ module Algorithm.EqSat.Storage.SQLite
   , refreshFitness
   , query
   , flushStore
+  , loadPagesBulk
   ) where
 
 import Control.Monad (forM, forM_, when)
@@ -35,7 +36,7 @@ import Data.Int (Int64)
 import Data.Maybe (catMaybes, fromMaybe, listToMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
-import Data.List (foldl')
+import Data.List (foldl', intercalate)
 import qualified Data.IntSet as IntSet
 import qualified Data.IntMap as IntMap
 import qualified Data.HashMap.Strict as HashMap
@@ -44,6 +45,8 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Set as RangeSet
 import Data.Binary (decode, encode)
 import qualified Data.ByteString.Lazy as BL
+import qualified Data.ByteString as BS
+import qualified Data.Text.Encoding as TE
 
 import Database.SQLite3
   ( Database, SQLData(..), StepResult(..)
@@ -59,17 +62,21 @@ import Algorithm.EqSat.Info (insertFitness)
 import Algorithm.EqSat.Store
   ( GraphRows(..), EClassRow(..), exportEGraph, importEGraph, rebuildDBs )
 import Algorithm.EqSat.Storage.Backend
-  ( SqlValue(..), SqlBackend(..), sqlToInt, sqlToMaybeDouble, sqlToText )
+  ( SqlValue(..), SqlBackend(..), sqlToInt, sqlToMaybeDouble, sqlToText, sqlToBlob )
 import Algorithm.EqSat.Storage.ClassStore
-  ( classStoreTable, openClassStore, allPages, classStoreHandle, hex, unhex )
+  ( classStoreTable, openClassStore, allPages, classStoreHandle )
 import Algorithm.EqSat.Storage.Query (readDatasetFit, writeDatasetFit, firstDatasetId)
 import Algorithm.EqSat.Storage.Stream (streamRootsByOp)
 import Algorithm.EqSat.Storage.Types
 import Algorithm.EqSat.Storage.Schema (createSchema, schemaSQL)
 
 -- | Default cache capacity (pages) for the lazily paged e-class store.
+-- Kept small: the cache is an LRU of deserialized EClass objects (each with
+-- HashSets of nodes/parents), so a large cap wastes resident memory.  The
+-- out-of-core matcher streams roots directly from the DB and the extraction
+-- path reads one class at a time, so a small working set suffices.
 defaultClassCap :: Int
-defaultClassCap = 50000
+defaultClassCap = 1000
 
 -- ---------------------------------------------------------------------------
 -- SQLite driver instance
@@ -112,8 +119,10 @@ instance SqlBackend Database where
           Row  -> do
             cols <- columns stmt
             let eid = case cols of (SQLInteger i : _) -> i; _ -> 0
-                hv  = case cols of (_ : SQLText t : _) -> t; _ -> ""
-            k eid (unhex hv)
+                blob = case cols of (_ : SQLBlob bs : _) -> bs
+                                    (_ : SQLText t : _)  -> TE.encodeUtf8 t
+                                    _                    -> BS.empty
+            k eid blob
             go stmt
   createSchemaDb db = mapM_ (exec db) schemaSQL
 
@@ -121,14 +130,15 @@ toSqlData :: SqlValue -> SQLData
 toSqlData (SqlInteger n) = SQLInteger n
 toSqlData (SqlFloat d)   = SQLFloat d
 toSqlData (SqlText t)    = SQLText t
+toSqlData (SqlBlob bs)   = SQLBlob bs
 toSqlData SqlNull        = SQLNull
 
 fromSqlData :: SQLData -> SqlValue
 fromSqlData (SQLInteger n) = SqlInteger n
 fromSqlData (SQLFloat d)   = SqlFloat d
 fromSqlData (SQLText t)    = SqlText t
+fromSqlData (SQLBlob bs)   = SqlBlob bs
 fromSqlData SQLNull        = SqlNull
-fromSqlData _              = SqlNull
 
 -- | Driver-neutral parameterized query (abstracts the concrete backend).
 query :: SqlBackend db => db -> Text -> [SqlValue] -> IO [[SqlValue]]
@@ -170,7 +180,6 @@ saveGraph db dsid eg = do
         writeMeta db rows
         writeNodes db rows
         writeClasses db rows
-        writeParents db rows
         writeDatasetFitRows db dsid rows
         writeClassPages db rows
   where
@@ -204,7 +213,6 @@ graphClassRows eg = case _classStore eg of
 
 clearTables :: SqlBackend db => db -> IO ()
 clearTables db = do
-  execDb db "DELETE FROM parent"
   execDb db "DELETE FROM meta"
   execDb db "DELETE FROM enode_child"
   execDb db "DELETE FROM eclass_node"
@@ -219,7 +227,7 @@ writeClassPages db rows =
   forM_ (IntMap.toAscList (_grEClasses rows)) $ \(eid, r) ->
     run db ("INSERT INTO " <> classStoreTable <> " (key, blob) VALUES (?, ?)")
       [ SqlInteger (fromIntegral eid)
-      , SqlText (hex (BL.toStrict (encode (EClass eid (_rcNodes r) (_rcParents r) (_rcHeight r) (_rcInfo r))))) ]
+      , SqlBlob (BL.toStrict (encode (EClass eid (_rcNodes r) (_rcParents r) (_rcHeight r) (_rcInfo r)))) ]
 
 writeMeta :: SqlBackend db => db -> GraphRows -> IO ()
 writeMeta db rows = do
@@ -256,18 +264,6 @@ writeClasses db rows =
       [ SqlInteger (fromIntegral eid)
       , SqlInteger (fromIntegral canon)
       , SqlInteger (fromIntegral (maybe 0 _rcHeight (IntMap.lookup eid (_grEClasses rows)))) ]
-
--- | Persist the reverse edges: for every (parent class, parent e-node) in each
--- class's @_parents@, a @parent@ row keyed by the child e-class. This makes the
--- parent relation queryable per class without scanning @enode@/@eclass_node@.
-writeParents :: SqlBackend db => db -> GraphRows -> IO ()
-writeParents db rows =
-  forM_ (IntMap.toAscList (_grEClasses rows)) $ \(eid, r) ->
-    forM_ (Set.toList (_rcParents r)) $ \(pEid, pEn) ->
-      run db "INSERT INTO parent (child_eid, parent_eid, parent_enode_key) VALUES (?, ?, ?)"
-        [ SqlInteger (fromIntegral eid)
-        , SqlInteger (fromIntegral pEid)
-        , SqlText (T.pack (enodeKey pEn)) ]
 
 -- | Write the per-(dataset, e-class) fitness rows for every class in a graph.
 writeDatasetFitRows :: SqlBackend db => db -> Int -> GraphRows -> IO ()
@@ -312,11 +308,9 @@ loadGraph db = do
       if null pages
         then do
           -- fully relational path (databases written before the page store)
-          parents <- readParents db
-          let storedParents = IntMap.fromListWith Set.union
-                [ (c, Set.singleton (pEid, pEn))
-                | (c, pEid, pEn) <- parents ]
-              classes = buildClasses canon nodeToEClass storedParents (IntMap.fromList fit) (IntMap.fromList [ (eid, h) | (eid, _, h) <- ecLst ])
+          -- Parent pointers are recomputed from nodeToEClass (the parent table
+          -- has been removed; buildClasses handles the fallback).
+          let classes = buildClasses canon nodeToEClass IntMap.empty (IntMap.fromList fit) (IntMap.fromList [ (eid, h) | (eid, _, h) <- ecLst ])
               rows    = GraphRows canon nodeToEClass classes nextId trackDBs
           pure (importEGraph rows)
         else do
@@ -438,11 +432,7 @@ loadGraphLazy db dsid = do
               rep eid = IntMap.findWithDefault eid eid canon0
               nodeToEClass0 = HashMap.fromList enodes
               nodeToEClass  = HashMap.map rep nodeToEClass0
-          parents <- readParents db
-          let storedParents = IntMap.fromListWith Set.union
-                [ (c, Set.singleton (pEid, pEn))
-                | (c, pEid, pEn) <- parents ]
-              classes = buildClasses canon0 nodeToEClass storedParents fitMap
+              classes = buildClasses canon0 nodeToEClass IntMap.empty fitMap
                         (IntMap.fromList [ (eid, h) | (eid, _, h) <- ecLst ])
               rows    = GraphRows canon0 nodeToEClass classes nextId trackDBs
           pure (importEGraph rows)
@@ -504,21 +494,9 @@ readClasses db = do
   rows <- query db "SELECT eid, canonical, height FROM eclass" []
   pure [ (sqlToInt eid, sqlToInt c, sqlToInt h) | [eid, c, h] <- rows ]
 
--- | Read (child e-class, parent e-class, parent e-node) edges from the @parent@
--- table. The rows are grouped per child class by 'loadGraph'.
-readParents :: SqlBackend db => db -> IO [(EClassId, EClassId, ENode)]
-readParents db = do
-  rows <- query db "SELECT child_eid, parent_eid, parent_enode_key FROM parent" []
-  pure (catMaybes
-    [ do
-        en <- parseEnodeKey (T.unpack (sqlToText k))
-        pure (sqlToInt c, sqlToInt p, en)
-    | [c, p, k] <- rows ])
-
 -- | Rebuild @_grEClasses@ rows: only canonical roots carry real class rows.
--- Parent pointers come from the stored @parent@ relation when present, falling
--- back to recomputation from the node -> class map (e.g. databases written
--- before the @parent@ table existed, or hand-built rows).
+-- Parent pointers are recomputed from the node -> class map (the parent table
+-- has been removed; the cstore_page blobs store the authoritative parent set).
 buildClasses
   :: IntMap.IntMap EClassId                       -- ^ canonical eid -> eid (self-map for roots)
   -> HashMap.HashMap ENode EClassId               -- ^ node -> class
@@ -590,3 +568,27 @@ refreshFitness db dsid eg = do
                 c <- canonical eid
                 insertFitness c f (parseTheta (T.unpack theta))
   pure (Right (runIdentity $ execStateT m eg))
+
+-- | Bulk-load page blobs for a list of e-class IDs in one query, returning
+-- an IntMap of deserialized EClass values. For lists exceeding SQLite's
+-- parameter limit, the query is chunked automatically.
+loadPagesBulk :: SqlBackend db => db -> [EClassId] -> IO (IntMap.IntMap EClass)
+loadPagesBulk _ [] = pure IntMap.empty
+loadPagesBulk db eids = do
+  let chunks = chunkList 500 eids
+  results <- mapM loadChunk chunks
+  pure $ IntMap.unions results
+  where
+    chunkList _ [] = []
+    chunkList n xs = let (h, t) = splitAt n xs in h : chunkList n t
+
+    loadChunk ids = do
+      let placeholders = intercalate "," (replicate (length ids) "?")
+          params = map (SqlInteger . fromIntegral) ids
+      rows <- queryDb db
+        ("SELECT key, blob FROM cstore_page WHERE key IN (" <> T.pack placeholders <> ")")
+        params
+      pure $ IntMap.fromList
+        [ (sqlToInt k, decode (BL.fromStrict (sqlToBlob b)))
+        | [k, b] <- rows
+        ]

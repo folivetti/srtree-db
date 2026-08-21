@@ -1,5 +1,9 @@
 # Changelog for srtree-db
 
+## 0.1.1.0
+
+- Added cli tools to populate and fit data into a database 
+
 ## 0.1.0.0
 
 - Initial release

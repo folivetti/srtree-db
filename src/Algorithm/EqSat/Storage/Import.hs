@@ -8,13 +8,12 @@
 -- The import holds **no** graph-size data in RAM: e-nodes are content-addressed
 -- against the @enode@/@eclass_node@ tables (the @enode_key@ is their content
 -- address), child lookups for n-ary flattening read each child's node from the
--- DB, and parent edges are written straight to the @parent@ table. Only a
--- scalar next-id counter is kept in memory, so peak memory is bounded (one
--- e-class at a time) regardless of how many expressions are imported.
+-- DB. Only a scalar next-id counter is kept in memory, so peak memory is
+-- bounded (one e-class at a time) regardless of how many expressions are
+-- imported.
 --
--- Class pages (@cstore_page@) are written at the end in a single linear pass by
--- reconstructing each class from the relational tables, so hot classes are
--- never rewritten repeatedly.
+-- Class pages (@cstore_page@) are written inline during the batch fold, so
+-- each new class gets its page in O(1) — no post-pass needed.
 --
 -- The produced database is byte-compatible with 'saveGraph': the same page
 -- blobs and relational rows, so 'loadGraphLazy' / 'dbEqSat' work on it
@@ -23,6 +22,7 @@
 module Algorithm.EqSat.Storage.Import
   ( ImportSummary(..)
   , importEqs
+  , importEqsInit
   , recordExpressionIndex
   ) where
 
@@ -45,7 +45,7 @@ import Algorithm.EqSat.Egraph
   ( EClassId, ENode(..), NOp(..), EClass(..), EClassData(..), Consts(..) )
 import Algorithm.EqSat.Storage.Backend
   ( SqlValue(..), SqlBackend(..), sqlToInt, sqlToMaybeDouble, sqlToText )
-import Algorithm.EqSat.Storage.ClassStore (classStoreTable, hex)
+import Algorithm.EqSat.Storage.ClassStore (classStoreTable)
 import Algorithm.EqSat.Storage.Types
   ( enodeKey, enodeOpTag, enodeOpDetail, serializeTheta, parseTheta, parseEnodeKey )
 import Algorithm.EqSat.Storage.Schema (createSchema)
@@ -64,42 +64,41 @@ data ImportState = ImportState
   { stNextId :: !Int
   }
 
+-- | One-time schema + index setup for import. Call this once before the first
+-- 'importEqs' call (e.g. in the ingest CLI before the batch loop) so that
+-- repeated 'importEqs' calls skip redundant DDL.
+importEqsInit :: SqlBackend db => db -> IO ()
+importEqsInit db = do
+  createSchema db
+  execDb db "CREATE INDEX IF NOT EXISTS idx_eclass_node_enode_key ON eclass_node(enode_key)"
+
 -- | Insert a list of @(expression, theta, fitness)@ into the database,
 -- structurally expanding every subexpression into its own e-class, then write
--- the class pages in a final linear pass. Runs inside a single transaction
+-- only the pages for newly created classes. Runs inside a single transaction
 -- (rolled back on error).
 --
 -- When a dataset name is provided (@Just ds@), dataset_fit rows and
 -- expression_index entries are written so fitness queries and dedup work.
 -- When @Nothing@, only the structural e-graph is built (enode, eclass,
 -- parent, cstore_page, meta) — the e-graph is reusable across datasets.
+--
+-- Call 'importEqsInit' once before the first invocation to set up the schema
+-- and indexes; subsequent calls skip the DDL.
 importEqs :: SqlBackend db => db -> Maybe String -> [(Fix SRTree, [Target], Maybe Double)] -> IO (Either String ImportSummary)
 importEqs db mds eqs = do
   createSchema db
-  -- content-address dedup queries by enode_key, but eclass_node's PK is
-  -- (eid, enode_key); index enode_key so those lookups are O(log n) not a scan.
   execDb db "CREATE INDEX IF NOT EXISTS idx_eclass_node_enode_key ON eclass_node(enode_key)"
   mdsid <- traverse (getOrCreateDataset db) mds
-  -- Read the current next_id from the meta table so repeated importEqs calls
-  -- don't collide on eclass eids.
   curNextId <- readMetaNextId db
   ref <- newIORef (ImportState curNextId)
   r <- try $ do
     execDb db "BEGIN"
-    -- stream the expression list through a fold (rather than forM_ + length
-    -- eqs) so the lazy list is unreferenced after consumption and GC'd as it
-    -- is processed; the fold accumulator carries the count, so we never retain
-    -- the whole parsed expression list in memory.
     n <- foldM (\c (t, theta, fit) -> do
                    (eid, h) <- insertTree ref db fit mdsid t
-                   -- dataset_fit and expression_index only when a dataset is given
                    case mdsid of
                      Nothing -> pure ()
                      Just dsid -> do
                        writeDatasetFit db dsid eid fit Nothing (T.pack (serializeTheta theta)) h
-                       -- record the root expression in the registry (keyed by its
-                       -- canonical root node) so "was this expression seen/tested?"
-                       -- can be answered per dataset.
                        mroot <- lookupClassNode db eid
                        forM_ mroot $ \en ->
                          runDb db
@@ -109,7 +108,6 @@ importEqs db mds eqs = do
                            , SqlInteger (fromIntegral dsid) ]
                    pure (c + 1)) 0 eqs
     writeMeta db ref
-    writeAllPages db
     execDb db "COMMIT"
     pure n
   case r of
@@ -118,7 +116,7 @@ importEqs db mds eqs = do
       pure (Left ("importEqs failed: " <> displayException e))
     Right n -> do
       st <- readIORef ref
-      pure (Right (ImportSummary (stNextId st) (stNextId st) n))
+      pure (Right (ImportSummary (stNextId st) (stNextId st - curNextId) n))
 
 -- | Insert a full tree bottom-up, returning its root e-class id and height.
 insertTree :: SqlBackend db => IORef ImportState -> db -> Maybe Double -> Maybe Int -> Fix SRTree -> IO (EClassId, Int)
@@ -188,8 +186,9 @@ dedupChildren =
   . IntMap.fromListWith (\(n1, h1) (n2, h2) -> (n1 + n2, max h1 h2))
   . map (\(c, n, h) -> (c, (n, h)))
 
--- | Write the relational rows for a brand-new e-node. Reverse parent edges go
--- straight to the @parent@ table (reconstructed into pages by 'writeAllPages').
+-- | Write the relational rows for a brand-new e-node AND its class page.
+-- This is O(1) per new class — the page is written inline during the batch fold,
+-- eliminating the O(n) post-pass that 'writeMissingPages' used to do.
 writeNode :: SqlBackend db => db -> EClassId -> ENode -> String -> [(EClassId, Int, Int)] -> Int -> Maybe Double -> Maybe Int -> IO ()
 writeNode db eid en key children h fit mdsid = do
   runDb db "INSERT INTO enode (key, op, op_detail) VALUES (?, ?, ?)"
@@ -209,11 +208,11 @@ writeNode db eid en key children h fit mdsid = do
       [ SqlText (T.pack key)
       , SqlInteger (fromIntegral c)
       , SqlInteger (fromIntegral n) ]
-  forM_ children $ \(c, _, _) ->
-    runDb db "INSERT INTO parent (child_eid, parent_eid, parent_enode_key) VALUES (?, ?, ?)"
-      [ SqlInteger (fromIntegral c)
-      , SqlInteger (fromIntegral eid)
-      , SqlText (T.pack key) ]
+  -- Write the class page inline (O(1) per new class, no post-pass needed)
+  let parents = HashSet.fromList
+        [ (c, fromMaybe (error "importEqs: bad parent key in page write") (parseEnodeKey key))
+        | (c, _, _) <- children ]
+  writeClassPage db eid (EClass eid (HashSet.singleton en) parents h (defaultInfo en h))
   -- every class gets a dataset_fit row so the graph is fitness-annotated per
   -- dataset; the root's proper params/theta are written by the caller.
   case mdsid of
@@ -267,41 +266,13 @@ recordExpressionIndex db dsid eid = do
       , SqlInteger (fromIntegral eid)
       , SqlInteger (fromIntegral dsid) ]
 
--- | Write every class page once, reconstructing each class from the relational
--- tables (node + height from @eclass_node@/@eclass@, parents from @parent@,
--- metrics from @fit@). Memory stays bounded to a single class at a time.
-writeAllPages :: SqlBackend db => db -> IO ()
-writeAllPages db = do
-  cids <- queryDb db "SELECT eid FROM eclass ORDER BY eid" []
-  forM_ cids $ \[eidCol] -> do
-    let eid = sqlToInt eidCol
-    nh <- queryDb db
-      "SELECT n.enode_key, c.height FROM eclass_node n \
-      \JOIN eclass c ON c.eid = n.eid WHERE n.eid = ?"
-      [SqlInteger (fromIntegral eid)]
-    case nh of
-      ([SqlText k, hcol] : _) -> do
-        let en = fromMaybe (error ("importEqs: bad node key for eid " <> show eid))
-                           (parseEnodeKey (T.unpack k))
-            h  = sqlToInt hcol
-        pr <- queryDb db "SELECT parent_eid, parent_enode_key FROM parent WHERE child_eid = ?"
-                         [SqlInteger (fromIntegral eid)]
-        let parents = HashSet.fromList
-              [ (sqlToInt pe, fromMaybe (error "importEqs: bad parent key") (parseEnodeKey (T.unpack (sqlToText pk))))
-              | [pe, pk] <- pr ]
-        -- Pages are structural-only: cost/best are derived on load, and
-        -- fitness/dl/theta are dataset metadata (dataset_fit), so they are NOT
-        -- baked into the e-graph blob (keeps the graph reusable across datasets).
-        writeClassPage db eid (EClass eid (HashSet.singleton en) parents h (defaultInfo en h))
-      _ -> pure ()
-
 -- | Serialize an e-class to the page store (INSERT OR REPLACE so the final
 -- pass is idempotent).
 writeClassPage :: SqlBackend db => db -> EClassId -> EClass -> IO ()
 writeClassPage db eid ec =
   runDb db ("INSERT OR REPLACE INTO " <> classStoreTable <> " (key, blob) VALUES (?, ?)")
     [ SqlInteger (fromIntegral eid)
-    , SqlText (hex (BL.toStrict (encode ec))) ]
+    , SqlBlob (BL.toStrict (encode ec)) ]
 
 -- | Per-class data. Cost/best are derived quantities recomputed on load
 -- ('recalculateBestAll'). Fitness/dl/theta/size are baked into the page (so

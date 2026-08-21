@@ -17,9 +17,8 @@
 --     O(n) per call).
 --   * Every access refreshes recency (true LRU), so the hot classes a
 --     rebuild/rewrite pass revisits stay resident.
---   * Pages are stored hex-encoded in a TEXT column so the same DDL/CRUD
---     runs unchanged on SQLite and PostgreSQL (a bytea/BLOB column is a
---     possible later optimization).
+--   * Pages are stored as binary BLOBs for compact storage and zero-copy
+--     reads.
 --
 -- Driver-neutrality note: the store talks only through 'SqlBackend' and
 -- spells writes as DELETE+INSERT inside one transaction (both drivers
@@ -49,8 +48,6 @@ module Algorithm.EqSat.Storage.ClassStore
   , clearFrontier
   , setFrontierActive
   , initFrontier
-  , hex
-  , unhex
   ) where
 
 import Control.Monad (forM_, unless, when)
@@ -66,30 +63,11 @@ import Data.List (nub)
 import qualified Data.ByteString.Lazy as BL
 
 import Algorithm.EqSat.Storage.Backend
-  ( SqlValue(..), SqlBackend(..), sqlToInt, sqlToText )
+  ( SqlValue(..), SqlBackend(..), sqlToInt, sqlToText, sqlToBlob )
 import Algorithm.EqSat.Storage.Types
   ( enodeKey, enodeOpTag, enodeOpDetail, opDetailOf )
 import Algorithm.EqSat.Egraph
   ( EClass, EClassPageStore(..), ENode(..), _eClassId )
-
--- ---------------------------------------------------------------------------
--- hex encoding of page blobs (driver-neutral TEXT storage)
-
-hex :: BS.ByteString -> T.Text
-hex = T.pack . concatMap go . BS.unpack
-  where
-    go b =
-      let hi = fromIntegral (b `div` 16)
-          lo = fromIntegral (b `mod` 16)
-      in "0123456789abcdef" !! hi : ["0123456789abcdef" !! lo]
-
-unhex :: T.Text -> BS.ByteString
-unhex = BS.pack . go . T.unpack
-  where
-    go (a:b:r) = fromIntegral (hexv a * 16 + hexv b) : go r
-    go _       = []
-    hexv c | c >= '0' && c <= '9' = fromEnum c - fromEnum '0'
-           | otherwise            = fromEnum c - fromEnum 'a' + 10
 
 -- ---------------------------------------------------------------------------
 -- LRU page cache
@@ -144,7 +122,7 @@ markDirty eid page pc =
 -- ---------------------------------------------------------------------------
 -- store
 
--- | A paging store over a table @key TEXT PRIMARY KEY, blob TEXT NOT NULL@,
+-- | A paging store over a table @key INTEGER PRIMARY KEY, blob BLOB NOT NULL@,
 -- connected to a 'SqlBackend' database.
 data PageStore db = PageStore
   { psDb        :: db
@@ -167,7 +145,7 @@ newPageStore :: SqlBackend db => db -> T.Text -> Int -> Int -> IO (PageStore db)
 newPageStore db tbl cap flushEvery' = do
   execDb db
     ("CREATE TABLE IF NOT EXISTS " <> tbl <>
-     " (key TEXT PRIMARY KEY, blob TEXT NOT NULL)")
+     " (key INTEGER PRIMARY KEY, blob BLOB NOT NULL)")
   cache <- newIORef (emptyCache cap)
   nodes <- newIORef Set.empty
   canons <- newIORef IM.empty
@@ -197,8 +175,12 @@ readPage ps eid = do
                   [SqlInteger (fromIntegral eid)]
         case rows of
           [] -> pure Nothing
+          [[SqlBlob page]] -> do
+            writeIORef (psCache ps) (insertEvict eid page c0)
+            pure (Just page)
           [[SqlText hv]] -> do
-            let page = unhex hv
+            -- backward compat: old databases may still have hex-encoded TEXT
+            let page = sqlToBlob (SqlText hv)
             writeIORef (psCache ps) (insertEvict eid page c0)
             pure (Just page)
           _ -> fail "ClassStore.readPage: unexpected row shape"
@@ -236,7 +218,7 @@ writeback ps = do
       runDb db ("DELETE FROM " <> tbl <> " WHERE key = ?")
         [SqlInteger (fromIntegral eid)]
       runDb db ("INSERT INTO " <> tbl <> " (key, blob) VALUES (?, ?)")
-        [ SqlInteger (fromIntegral eid), SqlText (hex page) ]
+        [ SqlInteger (fromIntegral eid), SqlBlob page ]
     execDb db "COMMIT"
     modifyIORef' (psCache ps) (\cc -> cc { pcPend = IM.empty, pcPendN = 0 })
   flushNodes ps
@@ -312,7 +294,7 @@ flushEvery = psFlushEvery
 allPages :: SqlBackend db => PageStore db -> IO [(Int, BS.ByteString)]
 allPages ps = do
   rows <- queryDb (psDb ps) ("SELECT key, blob FROM " <> psTable ps) []
-  pure [ (sqlToInt k, unhex (sqlToText b)) | [k, b] <- rows ]
+  pure [ (sqlToInt k, sqlToBlob b) | [k, b] <- rows ]
 
 -- | Read every e-class id currently stored in the page table (keys only). This
 -- does NOT load the page blobs, so callers that only need the id set (e.g.

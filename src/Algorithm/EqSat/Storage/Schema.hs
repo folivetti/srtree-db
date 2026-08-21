@@ -8,12 +8,12 @@
 --   * @enode_child@ - ENAry multiset children (@child_eid@, @cnt@)
 --   * @eclass@    - e-class id -> canonical representative + height
 --   * @eclass_node@ - canonical e-node -> e-class membership
---   * @parent@    - reverse edges: child e-class -> (parent e-class, parent e-node)
---   * @fit@       - per-class risk metrics (fitness, dl, size, theta)
+--   * @cstore_page@ - lazily paged e-class blobs (authoritative body store)
+--   * @dataset_fit@ - per-dataset per-class risk metrics
 --
 -- 'schemaSQL' is the SQLite DDL; 'Algorithm.EqSat.Storage.Postgres' carries
 -- the equivalent PostgreSQL DDL (identity keys, deferred FK checks,
--- @DOUBLE PRECISION@). Dataset-specific fit tables are a later phase.
+-- @DOUBLE PRECISION@).
 module Algorithm.EqSat.Storage.Schema
   ( schemaSQL
   , createSchema
@@ -48,14 +48,9 @@ schemaSQL =
     <> " eid INTEGER NOT NULL REFERENCES eclass(eid) ON DELETE CASCADE,"
     <> " enode_key TEXT NOT NULL REFERENCES enode(key) ON DELETE CASCADE,"
     <> " PRIMARY KEY (eid, enode_key))"
-  , "CREATE TABLE IF NOT EXISTS parent ("
-    <> " child_eid INTEGER NOT NULL REFERENCES eclass(eid) ON DELETE CASCADE,"
-    <> " parent_eid INTEGER NOT NULL,"
-    <> " parent_enode_key TEXT NOT NULL REFERENCES enode(key) ON DELETE CASCADE,"
-    <> " PRIMARY KEY (child_eid, parent_eid, parent_enode_key))"
   , "CREATE TABLE IF NOT EXISTS cstore_page ("
-    <> " key TEXT PRIMARY KEY,"
-    <> " blob TEXT NOT NULL)"
+    <> " key INTEGER PRIMARY KEY,"
+    <> " blob BLOB NOT NULL)"
   , "CREATE TABLE IF NOT EXISTS frontier ("
     <> " eid INTEGER PRIMARY KEY REFERENCES eclass(eid) ON DELETE CASCADE,"
     <> " updated_at TEXT)"
