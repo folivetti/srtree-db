@@ -6,6 +6,7 @@ module FitData
   ( FitDataOpts(..)
   , fitdataParser
   , runFitData
+  , runRefit
   ) where
 
 import Control.Concurrent (getNumCapabilities)
@@ -131,15 +132,19 @@ runFitData opts = do
               batchPages <- loadPagesBulk db (IntSet.toList batchIds)
               let !cache0 = batchPages
 
-              -- Phase 1: expand batch to include all reachable sub-classes
-              let needed = foldl' (\s eid -> s `IntSet.union` expandTreeIds cache0 eid) IntSet.empty batch
-                  missing = IntSet.toList (IntSet.difference needed (IntSet.fromList (IntMap.keys cache0)))
-              cache1 <- if null missing then pure cache0
-                        else do
-                          putStrLn $ "  Loading " ++ show (length missing) ++ " sub-expression pages..."
-                          hFlush stdout
-                          newPages <- loadPagesBulk db missing
-                          pure (cache0 `IntMap.union` newPages)
+              -- Phase 1: iteratively expand until all transitive sub-classes are loaded
+              let expandLoop !cache = do
+                    let needed = foldl' (\s eid -> s `IntSet.union` expandTreeIds cache eid) IntSet.empty batch
+                        missing = IntSet.toList (IntSet.difference needed (IntSet.fromList (IntMap.keys cache)))
+                    if null missing
+                      then pure (cache, needed)
+                      else do
+                        putStrLn $ "  Loading " ++ show (length missing) ++ " sub-expression pages..."
+                        hFlush stdout
+                        newPages <- loadPagesBulk db missing
+                        expandLoop (cache `IntMap.union` newPages)
+
+              (cache1, needed) <- expandLoop cache0
 
               -- Per-batch fitted set (thread-safe, discarded after batch)
               batchFitted <- newIORef IntSet.empty
@@ -174,6 +179,7 @@ fitOne quiet db dsid cache xTrain yTrain mYErr loss nIter nRep nNoiseParams coun
       let mTree = reconstructFromCache cache eid
       case mTree of
         Nothing -> do
+          writeDatasetFit db dsid eid Nothing Nothing (T.pack (serializeTheta [])) 0
           unless quiet $ putStrLn $ "  eclass " ++ show eid ++ ": not in cache (skipped)"
           atomicModifyIORef' counter (\n -> let !n' = n + 1 in (n', ()))
         Just tree -> do
@@ -287,3 +293,18 @@ showFit f
 
 withSQLite :: String -> (Database -> IO a) -> IO a
 withSQLite path = bracket (open (T.pack path)) close
+
+-- | Run refit: clear all fitted data for a dataset, then re-fit everything.
+runRefit :: FitDataOpts -> IO ()
+runRefit opts = do
+  let FitDataOpts{..} = opts
+  putStrLn $ "Refitting dataset: " ++ fitdataDataset
+  putStrLn $ "Clearing previous fit data..."
+  hFlush stdout
+  withSQLite fitdataDb $ \db -> do
+    dsid <- getOrCreateDataset db fitdataDataset
+    runDb db "DELETE FROM dataset_fit WHERE dataset_id = ?" [SqlInteger (fromIntegral dsid)]
+    putStrLn $ "Cleared fit data for dataset " ++ show dsid ++ "."
+    hFlush stdout
+  -- Now run the normal fitdata flow
+  runFitData opts
