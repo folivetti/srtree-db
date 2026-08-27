@@ -206,7 +206,7 @@ expandTreeIds cache root = go IntSet.empty 0 root
       | n >= 200 = seen
       | IntSet.member eid seen = seen
       | otherwise = case IntMap.lookup eid cache of
-          Nothing -> seen
+          Nothing -> IntSet.insert eid seen
           Just ec ->
             let seen' = IntSet.insert eid seen
                 nodes = Set.toList (_eNodes ec)
