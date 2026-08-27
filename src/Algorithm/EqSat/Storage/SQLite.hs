@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE BangPatterns #-}
 
 -- | SQLite-backed persistence for srtree e-graphs.
 --
@@ -28,7 +29,7 @@ module Algorithm.EqSat.Storage.SQLite
   , loadPagesBulk
   ) where
 
-import Control.Monad (forM, forM_, when)
+import Control.Monad (forM, forM_, when, foldM)
 import Control.Exception (SomeException, catch, displayException)
 import Control.Monad.Identity (runIdentity)
 import Control.Monad.State.Strict (execStateT)
@@ -102,6 +103,18 @@ instance SqlBackend Database where
           Row  -> do
             cols <- columns stmt
             go stmt (map fromSqlData cols : acc)
+  foldQueryDb db sql params seed0 go = withStatement db sql $ \stmt -> do
+    bind stmt (map toSqlData params)
+    goRows seed0 stmt
+    where
+      goRows !acc stmt = do
+        r <- step stmt
+        case r of
+          Done -> pure acc
+          Row  -> do
+            cols <- columns stmt
+            acc' <- go acc (map fromSqlData cols)
+            goRows acc' stmt
   -- O(1)-memory candidate-root enumeration: stream the distinct e-class ids by
   -- operator through a cursor, skipping the already-attempted set, and stop
   -- after @budget@ rows, so the matcher never materializes the whole (operator
@@ -576,8 +589,9 @@ loadPagesBulk :: SqlBackend db => db -> [EClassId] -> IO (IntMap.IntMap EClass)
 loadPagesBulk _ [] = pure IntMap.empty
 loadPagesBulk db eids = do
   let chunks = chunkList 500 eids
-  results <- mapM loadChunk chunks
-  pure $ IntMap.unions results
+  foldM (\acc chunkIds -> do
+    pages <- loadChunk chunkIds
+    pure $! IntMap.union acc pages) IntMap.empty chunks
   where
     chunkList _ [] = []
     chunkList n xs = let (h, t) = splitAt n xs in h : chunkList n t

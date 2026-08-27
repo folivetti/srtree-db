@@ -113,8 +113,8 @@ runFitData opts = do
   hFlush stdout
   withSQLite fitdataDb $ \db -> do
     dsid <- getOrCreateDataset db fitdataDataset
-    unfitted <- queryUnfitted db dsid
-    let total = length unfitted
+
+    total <- countUnfitted db dsid
     putStrLn $ "Found " ++ show total ++ " unfitted e-classes"
     hFlush stdout
 
@@ -123,44 +123,38 @@ runFitData opts = do
       else do
         nCaps <- getNumCapabilities
         counter <- newIORef (0 :: Int)
-        fittedSet <- newIORef IntSet.empty
-        cacheRef <- newIORef IntMap.empty
 
         let processBatch [] = pure ()
             processBatch batch = do
-              cache0 <- readIORef cacheRef
-              -- Phase 0: ensure batch root eclasses are in the cache
+              -- Phase 0: load batch root eclasses into a fresh local cache
               let batchIds = IntSet.fromList batch
-                  batchMissing = IntSet.toList (IntSet.difference batchIds (IntSet.fromList (IntMap.keys cache0)))
-              when (not (null batchMissing)) $ do
-                newPages <- loadPagesBulk db batchMissing
-                writeIORef cacheRef (cache0 `IntMap.union` newPages)
-              cache1 <- readIORef cacheRef
+              batchPages <- loadPagesBulk db (IntSet.toList batchIds)
+              let !cache0 = batchPages
 
               -- Phase 1: expand batch to include all reachable sub-classes
-              let needed = foldl' (\s eid -> s `IntSet.union` expandTreeIds cache1 eid) IntSet.empty batch
-                  missing = IntSet.toList (IntSet.difference needed (IntSet.fromList (IntMap.keys cache1)))
-              when (not (null missing)) $ do
-                putStrLn $ "  Loading " ++ show (length missing) ++ " sub-expression pages..."
-                hFlush stdout
-                newPages <- loadPagesBulk db missing
-                writeIORef cacheRef (cache1 `IntMap.union` newPages)
+              let needed = foldl' (\s eid -> s `IntSet.union` expandTreeIds cache0 eid) IntSet.empty batch
+                  missing = IntSet.toList (IntSet.difference needed (IntSet.fromList (IntMap.keys cache0)))
+              cache1 <- if null missing then pure cache0
+                        else do
+                          putStrLn $ "  Loading " ++ show (length missing) ++ " sub-expression pages..."
+                          hFlush stdout
+                          newPages <- loadPagesBulk db missing
+                          pure (cache0 `IntMap.union` newPages)
 
-              cache <- readIORef cacheRef
-              fittedNow <- readIORef fittedSet
+              -- Per-batch fitted set (thread-safe, discarded after batch)
+              batchFitted <- newIORef IntSet.empty
 
               -- Phase 2: fit all unfitted classes in the expanded set
-              let toFit = filter (\eid -> not (IntSet.member eid fittedNow)) (IntSet.toList needed)
+              let toFit = IntSet.toList needed
               setMTPopParallel True
               let chunks = chunk nCaps toFit
-              void $ mapConcurrently_ (mapM_ (fitOne fitdataQuiet db dsid cache xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep nNoiseParams counter fittedSet)) chunks
+              void $ mapConcurrently_ (mapM_ (fitOne fitdataQuiet db dsid cache1 xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep nNoiseParams counter batchFitted)) chunks
               setMTPopParallel False
+              -- cache1 and batchFitted go out of scope here — GC can reclaim
               unless fitdataQuiet $ putStrLn "  [checkpoint] committed batch"
-              fitted <- readIORef counter
-              when (fitted `mod` 100000 == 0) $ putStrLn ("fitted " ++ show fitted ++ " so far.")
 
-        let batches = chunk fitdataBatchSize unfitted
-        mapM_ processBatch batches
+        -- Stream IDs in batches using foldQueryDb to avoid retaining full list spine
+        processStreamingBatches db dsid fitdataBatchSize processBatch
 
         fitted <- readIORef counter
         putStrLn $ "Fitted " ++ show fitted ++ "/" ++ show total
@@ -181,7 +175,7 @@ fitOne quiet db dsid cache xTrain yTrain mYErr loss nIter nRep nNoiseParams coun
       case mTree of
         Nothing -> do
           unless quiet $ putStrLn $ "  eclass " ++ show eid ++ ": not in cache (skipped)"
-          modifyIORef' counter (+1)
+          atomicModifyIORef' counter (\n -> let !n' = n + 1 in (n', ()))
         Just tree -> do
           let !tree' = relabelParams tree
               !np = countParamsUniq tree' + nNoiseParams
@@ -192,8 +186,8 @@ fitOne quiet db dsid cache xTrain yTrain mYErr loss nIter nRep nNoiseParams coun
               let fitness = analyticalFit loss xTrain yTrain tree'
               writeDatasetFit db dsid eid (Just fitness) Nothing
                 (T.pack (serializeTheta [])) sz
-              modifyIORef' counter (+1)
-              modifyIORef' fittedSet (IntSet.insert eid)
+              atomicModifyIORef' counter (\n -> let !n' = n + 1 in (n', ()))
+              atomicModifyIORef' fittedSet (\s -> (IntSet.insert eid s, ()))
               unless quiet $ putStrLn $ "  eclass " ++ show eid ++ " (" ++ takeExpr tree' ++ "): fitness=" ++ showFit fitness ++ " [analytical]"
             else do
               let funAndGrad = compileLossAndGrad MultiThread loss mYErr xTrain yTrain tree'
@@ -205,8 +199,8 @@ fitOne quiet db dsid cache xTrain yTrain mYErr loss nIter nRep nNoiseParams coun
               let (bestFitness, bestTheta) = maximumBy (comparing fst) results
               writeDatasetFit db dsid eid (Just bestFitness) Nothing
                 (T.pack (serializeTheta [bestTheta])) sz
-              modifyIORef' counter (+1)
-              modifyIORef' fittedSet (IntSet.insert eid)
+              atomicModifyIORef' counter (\n -> let !n' = n + 1 in (n', ()))
+              atomicModifyIORef' fittedSet (\s -> (IntSet.insert eid s, ()))
               unless quiet $ putStrLn $ "  eclass " ++ show eid ++ " (" ++ takeExpr tree' ++ "): fitness=" ++ showFit bestFitness
 
 -- | Analytical fitness for parameter-free expressions.
@@ -229,15 +223,50 @@ analyticalFit loss xTrain yTrain tree =
       let mse = VU.sum (VU.map (\r -> r * r) residuals) / m
       in negate mse  -- fallback: use MSE
 
--- | Query for e-class IDs that are not yet fitted for a dataset.
-queryUnfitted :: SqlBackend db => db -> Int -> IO [EClassId]
-queryUnfitted db dsid = do
+-- | Count unfitted e-classes for a dataset.
+countUnfitted :: SqlBackend db => db -> Int -> IO Int
+countUnfitted db dsid = do
   rows <- queryDb db
+    "SELECT COUNT(*) FROM eclass e \
+    \LEFT JOIN dataset_fit df ON df.eid = e.eid AND df.dataset_id = ? \
+    \WHERE df.fitted IS NULL OR df.fitted = 0"
+    [SqlInteger (fromIntegral dsid)]
+  case rows of
+    [[cnt]] -> pure (sqlToInt cnt)
+    _       -> pure 0
+
+-- | Stream unfitted e-class IDs in batches, processing each batch
+-- without materializing the full ID list in memory.
+processStreamingBatches :: SqlBackend db
+                        => db -> Int -> Int -> ([EClassId] -> IO ()) -> IO ()
+processStreamingBatches db dsid batchSize processBatch = do
+  batchRef <- newIORef ([] :: [EClassId])
+  countRef <- newIORef (0 :: Int)
+  foldQueryDb db
     "SELECT e.eid FROM eclass e \
     \LEFT JOIN dataset_fit df ON df.eid = e.eid AND df.dataset_id = ? \
     \WHERE df.fitted IS NULL OR df.fitted = 0"
     [SqlInteger (fromIntegral dsid)]
-  pure [ sqlToInt eid | [eid] <- rows ]
+    ()
+    (\() cols -> case cols of
+      [eid] -> do
+        let !eid' = sqlToInt eid
+        batch <- readIORef batchRef
+        let !batch' = eid' : batch
+        n <- readIORef countRef
+        let !n' = n + 1
+        writeIORef countRef n'
+        if n' >= batchSize
+          then do
+            processBatch (reverse batch')
+            writeIORef batchRef []
+            writeIORef countRef 0
+          else writeIORef batchRef batch'
+        pure ()
+      _ -> pure ())
+  -- Process remaining
+  remaining <- readIORef batchRef
+  when (not (null remaining)) $ processBatch (reverse remaining)
 
 chunk :: Int -> [a] -> [[a]]
 chunk _ [] = []

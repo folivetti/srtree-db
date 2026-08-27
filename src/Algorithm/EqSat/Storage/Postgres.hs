@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE BangPatterns #-}
 
 -- | PostgreSQL-backed persistence for srtree e-graphs.
 --
@@ -134,6 +135,30 @@ instance SqlBackend Connection where
       _ -> do
         statusOK r "query"
         pure []
+
+  foldQueryDb conn sql params seed0 f = do
+    r <- pgExecParams conn sql params
+    st <- resultStatus r
+    case st of
+      TuplesOk -> do
+        ns <- ntuples r
+        nf <- nfields r
+        let n = fromEnum ns
+            m = fromEnum nf
+        let go !acc i
+              | i >= n    = pure acc
+              | otherwise = do
+                  row <- forM [0 .. m - 1] $ \j -> do
+                    v <- getvalue r (toRow i) (toColumn j)
+                    pure $ case v of
+                      Nothing -> SqlNull
+                      Just bs -> SqlText (TE.decodeUtf8 bs)
+                  acc' <- f acc row
+                  go acc' (i + 1)
+        go seed0 0
+      _ -> do
+        statusOK r "foldQuery"
+        pure seed0
 
   createSchemaDb conn = mapM_ (execDb conn) schemaPostgres
 

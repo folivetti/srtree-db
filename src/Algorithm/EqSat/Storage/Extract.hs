@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE BangPatterns #-}
 
 -- | Standalone SRTree reconstruction from the relational DB, without loading
 -- the full e-graph. Walks @cstore_page@ blobs one class at a time, resolving
@@ -218,7 +219,7 @@ expandTreeIds cache root = go IntSet.empty 0 root
     expandNode seen _ (EConst _)  = seen
     expandNode seen n (EUni _ t) = go seen (n + 1) t
     expandNode seen n (EBin _ l r) =
-      let seen' = go seen (n + 1) l
+      let !seen' = go seen (n + 1) l
       in go seen' (n + 1) r
     expandNode seen n (ENAry _ m) =
       foldl' (\s (cid, _) -> go s (n + 1) cid) seen (IntMap.toAscList m)

@@ -58,6 +58,10 @@ class SqlBackend db where
   insertIgnore :: db -> Text -> [SqlValue] -> IO ()
   -- | Run a parameterized query and return the raw result grid.
   queryDb :: db -> Text -> [SqlValue] -> IO [[SqlValue]]
+  -- | Fold over query results one row at a time without materializing the
+  -- full result list. This is O(1) memory in the row accumulator (unlike
+  -- 'queryDb' which builds a spine-strict list of all rows).
+  foldQueryDb :: db -> Text -> [SqlValue] -> a -> (a -> [SqlValue] -> IO a) -> IO a
   -- | Stream (bounded) the distinct e-class ids whose e-class contains a node
   -- with the given @op_detail@, for the streaming matcher, skipping any ids in
   -- @exclude@ (the already-attempted seen-set, so the per-rule budget advances
