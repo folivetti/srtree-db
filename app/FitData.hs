@@ -149,6 +149,9 @@ runFitData opts = do
 
               (cache1, needed) <- expandLoop cache0
 
+              -- Wrap all writes for this batch in a single transaction
+              execDb db "BEGIN"
+
               -- Phase 2: build jobs (reconstruct, handle cache misses)
               let toFit = IntSet.toList needed
               mjobs <- mapM (buildJob db dsid cache1 nNoiseParams counter) toFit
@@ -175,6 +178,10 @@ runFitData opts = do
               let chunks = chunk nCaps survivors
               void $ mapConcurrently_ (mapM_ (fitOne fitdataQuiet db dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter)) chunks
               setMTPopParallel False
+
+              execDb db "COMMIT"
+              -- Reclaim WAL space after each batch
+              execDb db "PRAGMA wal_checkpoint(TRUNCATE)"
               -- cache1, nanSet updates and survivors go out of scope here — GC can reclaim
               unless fitdataQuiet $ putStrLn "  [checkpoint] committed batch"
 
@@ -286,7 +293,10 @@ isInvalid f = isNaN f || isInfinite f
 writeInvalidFit :: SqlBackend db => db -> Int -> EClassId -> IO ()
 writeInvalidFit db dsid eid =
   runDb db
-    "INSERT OR REPLACE INTO dataset_fit (dataset_id, eid, fitness, dl, theta, size, evaluated, fitted) VALUES (?, ?, NULL, NULL, '', 0, 0, 1)"
+    "INSERT INTO dataset_fit (dataset_id, eid, fitness, dl, theta, size, evaluated, fitted) \
+    \VALUES (?, ?, NULL, NULL, '', 0, 0, 1) \
+    \ON CONFLICT (dataset_id, eid) DO UPDATE SET \
+    \fitness = NULL, dl = NULL, theta = '', size = 0, evaluated = 0, fitted = 1"
     [SqlInteger (fromIntegral dsid), SqlInteger (fromIntegral eid)]
 
 -- | Analytical fitness for parameter-free expressions.

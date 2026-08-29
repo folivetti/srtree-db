@@ -67,24 +67,29 @@ writeDatasetFit
   :: SqlBackend db => db -> Int -> EClassId
   -> Maybe Double -> Maybe Double -> Text -> Int -> IO ()
 writeDatasetFit db ds eid fit dl theta sz = do
-  let (fitCol, fitVal) = case fit of
-        Nothing -> ("NULL", Nothing)
-        Just f  -> ("?", Just (SqlFloat f))
-      (dlCol, dlVal) = case dl of
-        Nothing -> ("NULL", Nothing)
-        Just d  -> ("?", Just (SqlFloat d))
-      isFitted = case fit of { Nothing -> 0; Just _ -> 1 }
+  let (fitVal, fitExcluded) = case fit of
+        Nothing -> ("NULL", "excluded.fitness")
+        Just f  -> ("?",    "excluded.fitness")
+      (dlVal, dlExcluded) = case dl of
+        Nothing -> ("NULL", "excluded.dl")
+        Just d  -> ("?",    "excluded.dl")
+      isFitted    = case fit of { Nothing -> 0; Just _ -> 1 }
       isEvaluated = case fit of { Nothing -> 0; Just _ -> 1 }
+      fitParams = case fit of { Nothing -> []; Just f  -> [SqlFloat f] }
+      dlParams  = case dl  of { Nothing -> []; Just d  -> [SqlFloat d] }
   runDb db
-    ("INSERT OR REPLACE INTO dataset_fit \
+    ("INSERT INTO dataset_fit \
      \(dataset_id, eid, fitness, dl, theta, size, evaluated, fitted) \
-     \VALUES (?, ?, " <> fitCol <> ", " <> dlCol <> ", ?, ?, " <> T.pack (show isEvaluated) <> ", " <> T.pack (show isFitted) <> ")")
-    (catMaybes [ Just (SqlInteger (fromIntegral ds))
-               , Just (SqlInteger (fromIntegral eid))
-               , fitVal
-               , dlVal
-               , Just (SqlText theta)
-               , Just (SqlInteger (fromIntegral sz)) ])
+     \VALUES (?, ?, " <> fitVal <> ", " <> dlVal <> ", ?, ?, " <> T.pack (show isEvaluated) <> ", " <> T.pack (show isFitted) <> ") \
+     \ON CONFLICT (dataset_id, eid) DO UPDATE SET \
+     \fitness = " <> fitExcluded <> ", dl = " <> dlExcluded <> ", theta = excluded.theta, size = excluded.size, \
+     \evaluated = " <> T.pack (show isEvaluated) <> ", fitted = " <> T.pack (show isFitted))
+    ([ SqlInteger (fromIntegral ds)
+     , SqlInteger (fromIntegral eid)
+     ] ++ fitParams ++ dlParams ++
+     [ SqlText theta
+     , SqlInteger (fromIntegral sz)
+     ])
 
 -- | Read per-(dataset, e-class) fit rows.
 readDatasetFit
