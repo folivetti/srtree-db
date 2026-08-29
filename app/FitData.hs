@@ -180,8 +180,6 @@ runFitData opts = do
               setMTPopParallel False
 
               execDb db "COMMIT"
-              -- Reclaim WAL space after each batch
-              execDb db "PRAGMA wal_checkpoint(TRUNCATE)"
               -- cache1, nanSet updates and survivors go out of scope here — GC can reclaim
               unless fitdataQuiet $ putStrLn "  [checkpoint] committed batch"
 
