@@ -21,7 +21,7 @@ import Algorithm.EqSat.Storage.Backend (SqlBackend)
 import Algorithm.EqSat.Storage.SQLite (loadGraphLazy, saveGraph, flushStore)
 import Algorithm.EqSat.Storage.Query (getOrCreateDataset)
 
-import Database.SQLite3 (Database, open, close)
+import Database.SQLite3 (Database, open, close, exec)
 
 -- | CLI options for the eqsat sub-command.
 data EqSatOpts = EqSatOpts
@@ -93,4 +93,9 @@ runEqSatCmd EqSatOpts{..} = do
 
 -- | Open a SQLite database, run an action, and close it.
 withSQLite :: String -> (Database -> IO a) -> IO a
-withSQLite path = bracket (open (T.pack path)) close
+withSQLite path f = bracket openDb close f
+  where
+    openDb = do
+      db <- open (T.pack path)
+      exec db "PRAGMA journal_mode=WAL"
+      pure db

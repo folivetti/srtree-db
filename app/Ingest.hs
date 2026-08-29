@@ -28,7 +28,7 @@ import Algorithm.SRTree.AD (ADBackEnd(..))
 import Numeric.Optimization.NLOPT (LocalAlgorithm(..))
 import Algorithm.EqSat.Storage.Import (importEqs, importEqsInit, ImportSummary(..))
 import Algorithm.EqSat.Storage.SQLite ()
-import Database.SQLite3 (Database, open, close)
+import Database.SQLite3 (Database, open, close, exec)
 
 -- | CLI options for the ingest sub-command.
 data IngestOpts = IngestOpts
@@ -121,6 +121,7 @@ runIngest IngestOpts{..} = do
   -- Open DB
   putStrLn $ "Opening " ++ ingestDb ++ "..."
   db <- open (T.pack ingestDb)
+  exec db "PRAGMA journal_mode=WAL"
 
   -- One-time schema + index setup (skipped by repeated importEqs calls)
   importEqsInit db

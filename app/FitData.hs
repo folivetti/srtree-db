@@ -14,7 +14,8 @@ import Control.Concurrent.Async (mapConcurrently_)
 import Control.Monad (replicateM, when, unless, void)
 import Control.Exception (bracket)
 import Data.IORef
-import Data.List (maximumBy, foldl')
+import Data.List (maximumBy, foldl', sortBy)
+import Data.Maybe (catMaybes)
 import Data.Ord (comparing)
 import qualified Data.IntMap.Strict as IntMap
 import qualified Data.IntSet as IntSet
@@ -39,7 +40,7 @@ import Algorithm.EqSat.Storage.Extract (reconstructFromCache, expandTreeIds)
 import Algorithm.EqSat.Storage.SQLite (loadPagesBulk)
 import Algorithm.EqSat.Storage.Query (getOrCreateDataset, writeDatasetFit)
 import Algorithm.EqSat.Storage.Types (serializeTheta)
-import Database.SQLite3 (Database, open, close)
+import Database.SQLite3 (Database, open, close, exec)
 
 -- | CLI options for the fitdata sub-command.
 data FitDataOpts = FitDataOpts
@@ -124,6 +125,8 @@ runFitData opts = do
       else do
         nCaps <- getNumCapabilities
         counter <- newIORef (0 :: Int)
+        nanSet <- newIORef IntSet.empty
+        nanCount <- newIORef (0 :: Int)
 
         let processBatch [] = pure ()
             processBatch batch = do
@@ -146,16 +149,33 @@ runFitData opts = do
 
               (cache1, needed) <- expandLoop cache0
 
-              -- Per-batch fitted set (thread-safe, discarded after batch)
-              batchFitted <- newIORef IntSet.empty
-
-              -- Phase 2: fit all unfitted classes in the expanded set
+              -- Phase 2: build jobs (reconstruct, handle cache misses)
               let toFit = IntSet.toList needed
+              mjobs <- mapM (buildJob db dsid cache1 nNoiseParams counter) toFit
+              -- Bottom-up order: smaller subtrees first so NaN discoveries propagate
+              let jobs = sortBy (comparing jobSize) (catMaybes mjobs)
+
+              -- Phase 3: classify bottom-up, pruning any eclass that contains a NaN
+              -- subexpression, collecting only NLopt survivors.
+              survivorRef <- newIORef ([] :: [FitJob])
+              beforeNan <- readIORef nanCount
+              mapM_ (classify fitdataQuiet nanSet counter nanCount survivorRef db dsid cache1 xTrain yTrain mYErr fitdataLoss nNoiseParams) jobs
+              survivors <- readIORef survivorRef
+              afterNan <- readIORef nanCount
+              if afterNan > beforeNan
+                then do
+                  unless fitdataQuiet $ do
+                    putStrLn $ "  +" ++ show (afterNan - beforeNan)
+                      ++ " eclasses inserted with NaN this batch (total " ++ show afterNan ++ ")"
+                    hFlush stdout
+                else pure ()
+
+              -- Phase 4: parallel NLopt fit of survivors
               setMTPopParallel True
-              let chunks = chunk nCaps toFit
-              void $ mapConcurrently_ (mapM_ (fitOne fitdataQuiet db dsid cache1 xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep nNoiseParams counter batchFitted)) chunks
+              let chunks = chunk nCaps survivors
+              void $ mapConcurrently_ (mapM_ (fitOne fitdataQuiet db dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter)) chunks
               setMTPopParallel False
-              -- cache1 and batchFitted go out of scope here — GC can reclaim
+              -- cache1, nanSet updates and survivors go out of scope here — GC can reclaim
               unless fitdataQuiet $ putStrLn "  [checkpoint] committed batch"
 
         -- Stream IDs in batches using foldQueryDb to avoid retaining full list spine
@@ -165,49 +185,109 @@ runFitData opts = do
         putStrLn $ "Fitted " ++ show fitted ++ "/" ++ show total
                  ++ " expressions"
 
--- | Fit a single e-class from the preloaded cache.
-fitOne :: SqlBackend db
-       => Bool -> db -> Int -> IntMap.IntMap EClass
-       -> [VU.Vector Double] -> VU.Vector Double -> Maybe (VU.Vector Double)
-       -> Loss -> Int -> Int -> Int -> IORef Int -> IORef IntSet.IntSet -> EClassId -> IO ()
-fitOne quiet db dsid cache xTrain yTrain mYErr loss nIter nRep nNoiseParams counter fittedSet eid = do
-  -- Skip if already fitted (by a previous sub-expression fit in this batch)
-  alreadyFitted <- IntSet.member eid <$> readIORef fittedSet
-  if alreadyFitted
-    then pure ()
-    else do
-      let mTree = reconstructFromCache cache eid
-      case mTree of
-        Nothing -> do
-          writeDatasetFit db dsid eid Nothing Nothing (T.pack (serializeTheta [])) 0
-          unless quiet $ putStrLn $ "  eclass " ++ show eid ++ ": not in cache (skipped)"
-          atomicModifyIORef' counter (\n -> let !n' = n + 1 in (n', ()))
-        Just tree -> do
-          let !tree' = relabelParams tree
-              !np = countParamsUniq tree' + nNoiseParams
-              !sz = countNodes tree'
-          if np == 0
+-- | A unit of NLopt work: a reconstructed, relabeled expression with its
+-- parameter count and node size precomputed.
+data FitJob = FitJob
+  { jobEid   :: !EClassId
+  , jobTree  :: !(Fix SRTree)
+  , jobFree  :: !Bool        -- ^ structurally parameter-free (no Param nodes)
+  , jobNp    :: !Int         -- ^ total free params incl. loss noise params
+  , jobSize  :: !Int
+  }
+
+-- | Reconstruct a job for an eclass, writing an invalid (NULL-fitness) row and
+-- counting it when the eclass cannot be reconstructed from the cache.
+buildJob :: SqlBackend db
+         => db -> Int -> IntMap.IntMap EClass -> Int -> IORef Int
+         -> EClassId -> IO (Maybe FitJob)
+buildJob db dsid cache nNoiseParams counter eid = do
+  case reconstructFromCache cache eid of
+    Nothing -> do
+      writeInvalidFit db dsid eid
+      atomicModifyIORef' counter (\n -> let !n' = n + 1 in (n', ()))
+      pure Nothing
+    Just tree -> do
+      let !tree' = relabelParams tree
+          !nup   = countParamsUniq tree'
+          !np    = nup + nNoiseParams
+          !free  = nup == 0
+          !sz    = countNodes tree'
+      pure (Just (FitJob eid tree' free np sz))
+
+-- | Classify a single eclass (run in bottom-up order). If the expression
+-- contains any known-NaN subexpression, or is a parameter-less expression that
+-- evaluates to NaN/infinity, it is pruned (written as a NULL-fitness fitted row)
+-- and recorded in @nanSet@ so its ancestors propagate. Otherwise it is queued as
+-- an NLopt survivor.
+classify :: SqlBackend db
+         => Bool -> IORef IntSet.IntSet -> IORef Int -> IORef Int -> IORef [FitJob]
+         -> db -> Int -> IntMap.IntMap EClass
+         -> [VU.Vector Double] -> VU.Vector Double -> Maybe (VU.Vector Double)
+         -> Loss -> Int -> FitJob -> IO ()
+classify quiet nanSet counter nanCount survivorRef db dsid cache xTrain yTrain mYErr loss nNoiseParams (FitJob eid tree' free np sz) = do
+  let desc = expandTreeIds cache eid
+  nan <- readIORef nanSet
+  if not (IntSet.null (IntSet.intersection desc nan))
+    then prune
+    else if not free
+      then survivor
+      else do
+        -- Structurally parameter-free: evaluate analytically to decide NaN.
+        -- Handles the noise-param loss case (e.g. NLL Gaussian, np = nNoiseParams).
+        let fitness = analyticalFit loss xTrain yTrain tree'
+        if isInvalid fitness
+          then prune
+          else if np == 0
             then do
-              -- Analytical fit: no parameters, compute loss directly
-              let fitness = analyticalFit loss xTrain yTrain tree'
+              -- Fully parameter-less: analytic fit is exact.
               writeDatasetFit db dsid eid (Just fitness) Nothing
                 (T.pack (serializeTheta [])) sz
               atomicModifyIORef' counter (\n -> let !n' = n + 1 in (n', ()))
-              atomicModifyIORef' fittedSet (\s -> (IntSet.insert eid s, ()))
               unless quiet $ putStrLn $ "  eclass " ++ show eid ++ " (" ++ takeExpr tree' ++ "): fitness=" ++ showFit fitness ++ " [analytical]"
-            else do
-              let funAndGrad = compileLossAndGrad MultiThread loss mYErr xTrain yTrain tree'
-                  runRestart = do
-                    theta0 <- VU.replicateM np (randomRIO (-1, 1))
-                    let (theta, lossVal, _) = minimizeNLLWith funAndGrad VAR1 nIter theta0
-                    pure (negate lossVal, theta)
-              results <- replicateM nRep runRestart
-              let (bestFitness, bestTheta) = maximumBy (comparing fst) results
-              writeDatasetFit db dsid eid (Just bestFitness) Nothing
-                (T.pack (serializeTheta [bestTheta])) sz
-              atomicModifyIORef' counter (\n -> let !n' = n + 1 in (n', ()))
-              atomicModifyIORef' fittedSet (\s -> (IntSet.insert eid s, ()))
-              unless quiet $ putStrLn $ "  eclass " ++ show eid ++ " (" ++ takeExpr tree' ++ "): fitness=" ++ showFit bestFitness
+            else survivor
+  where
+    -- An eclass doomed to NaN (contains a known-NaN subexpr, or is itself NaN):
+    -- write a NULL-fitness fitted row, record it, and count it.
+    prune = do
+      writeInvalidFit db dsid eid
+      atomicModifyIORef' nanSet (\s -> (IntSet.insert eid s, ()))
+      atomicModifyIORef' nanCount (\n -> let !n' = n + 1 in (n', ()))
+      atomicModifyIORef' counter (\n -> let !n' = n + 1 in (n', ()))
+    survivor = do
+      atomicModifyIORef' survivorRef (\xs -> (FitJob eid tree' free np sz : xs, ()))
+
+-- | Fit one expression via NLopt. Only called on survivors that are not
+-- statically NaN. Runs @nRep@ restarts and keeps the best.
+fitOne :: SqlBackend db
+       => Bool -> db -> Int
+       -> [VU.Vector Double] -> VU.Vector Double -> Maybe (VU.Vector Double)
+       -> Loss -> Int -> Int -> IORef Int -> FitJob -> IO ()
+fitOne quiet db dsid xTrain yTrain mYErr loss nIter nRep counter (FitJob eid tree' _ np sz) = do
+  let funAndGrad = compileLossAndGrad MultiThread loss mYErr xTrain yTrain tree'
+      runRestart = do
+        theta0 <- VU.replicateM np (randomRIO (-1, 1))
+        let (theta, lossVal, _) = minimizeNLLWith funAndGrad VAR1 nIter theta0
+        pure (negate lossVal, theta)
+  results <- replicateM nRep runRestart
+  let (bestFitness, bestTheta) = maximumBy (comparing fst) results
+  writeDatasetFit db dsid eid (Just bestFitness) Nothing
+    (T.pack (serializeTheta [bestTheta])) sz
+  atomicModifyIORef' counter (\n -> let !n' = n + 1 in (n', ()))
+  unless quiet $ putStrLn $ "  eclass " ++ show eid ++ " (" ++ takeExpr tree' ++ "): fitness=" ++ showFit bestFitness
+
+-- | Whether a fitness value is unusable (NaN or +/-Infinity), so it can be
+-- pruned and propagated to ancestors.
+isInvalid :: Double -> Bool
+isInvalid f = isNaN f || isInfinite f
+
+-- | Write a fitted row with NULL fitness (used for pruned / cache-miss eclasses).
+-- Marks @fitted = 1@ so the eclass is removed from the unfitted queue but stays
+-- distinguishable from rows with a real fitness.
+writeInvalidFit :: SqlBackend db => db -> Int -> EClassId -> IO ()
+writeInvalidFit db dsid eid =
+  runDb db
+    "INSERT OR REPLACE INTO dataset_fit (dataset_id, eid, fitness, dl, theta, size, evaluated, fitted) VALUES (?, ?, NULL, NULL, '', 0, 0, 1)"
+    [SqlInteger (fromIntegral dsid), SqlInteger (fromIntegral eid)]
 
 -- | Analytical fitness for parameter-free expressions.
 -- No NLopt needed — compute loss directly.
@@ -251,7 +331,8 @@ processStreamingBatches db dsid batchSize processBatch = do
   foldQueryDb db
     "SELECT e.eid FROM eclass e \
     \LEFT JOIN dataset_fit df ON df.eid = e.eid AND df.dataset_id = ? \
-    \WHERE df.fitted IS NULL OR df.fitted = 0"
+    \WHERE df.fitted IS NULL OR df.fitted = 0 \
+    \ORDER BY e.eid ASC"
     [SqlInteger (fromIntegral dsid)]
     ()
     (\() cols -> case cols of
@@ -292,7 +373,12 @@ showFit f
   | otherwise   = show (fromIntegral (round (f * 1000) :: Int) / 1000 :: Double)
 
 withSQLite :: String -> (Database -> IO a) -> IO a
-withSQLite path = bracket (open (T.pack path)) close
+withSQLite path f = bracket openDb close f
+  where
+    openDb = do
+      db <- open (T.pack path)
+      exec db "PRAGMA journal_mode=WAL"
+      pure db
 
 -- | Run refit: clear all fitted data for a dataset, then re-fit everything.
 runRefit :: FitDataOpts -> IO ()
