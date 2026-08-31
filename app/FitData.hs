@@ -178,6 +178,7 @@ runFitData opts = do
               workers <- replicateM workerCount $ do
                 w <- open (T.pack fitdataDb)
                 exec w "PRAGMA journal_mode=WAL"
+                exec w "PRAGMA busy_timeout = 5000"
                 execDb w "BEGIN"
                 pure w
               let workerChunks = chunk workerCount survivors
