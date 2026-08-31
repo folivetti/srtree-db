@@ -7,6 +7,7 @@
 -- children recursively. Memory is O(depth) — no page cache, no in-memory maps.
 module Algorithm.EqSat.Storage.Extract
   ( extractTreeFromDB
+  , extractBestFromDB
   , readPage
   , reconstructFromCache
   , expandTreeIds
@@ -20,7 +21,7 @@ import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
 
 import Data.SRTree (Fix(..), SRTree(..), Op(..), Function(..))
-import Algorithm.EqSat.Egraph (EClassId, EClass(..), ENode(..), NOp(..), toOp)
+import Algorithm.EqSat.Egraph (EClassId, EClass(..), EClassData(..), ENode(..), NOp(..), toOp)
 import Algorithm.EqSat.Storage.Backend
   ( SqlBackend(..), SqlValue(..), sqlToInt, sqlToBlob )
 import Algorithm.EqSat.Storage.ClassStore (classStoreTable)
@@ -119,6 +120,94 @@ extractTreeFromDB db root = go IntSet.empty 0 root
                             _ -> Nothing
     normalizeSubDiv (Fix (Uni f t)) = Fix (Uni f (normalizeSubDiv t))
     normalizeSubDiv t = t
+
+-- | Like 'extractTreeFromDB' but follows @_best@ pointers (the cost-minimal
+-- e-node chosen by eqsat) instead of taking the first node from @_eNodes@.
+-- This is what 'getBestExpr' does, but without loading the full EGraph --
+-- pages are read directly from the DB, one per class, O(depth) memory.
+extractBestFromDB :: SqlBackend db => db -> EClassId -> IO (Maybe (Fix SRTree))
+extractBestFromDB db root = go IntSet.empty 0 root
+  where
+    budget :: Int
+    budget = 200
+
+    go :: IntSet -> Int -> EClassId -> IO (Maybe (Fix SRTree))
+    go _ n _ | n >= budget = pure Nothing
+    go seen n eid
+      | IntSet.member eid seen = pure Nothing
+      | otherwise = do
+          mPage <- readPage db eid
+          case mPage of
+            Nothing -> pure Nothing
+            Just page -> do
+              let ec = decode page :: EClass
+                  best = _best (_info ec)
+              expandNode (IntSet.insert eid seen) n best
+
+    expandNode :: IntSet -> Int -> ENode -> IO (Maybe (Fix SRTree))
+    expandNode _ _ (EVar ix)   = pure (Just (Fix (Var ix)))
+    expandNode _ _ (EParam ix) = pure (Just (Fix (Param ix)))
+    expandNode _ _ (EConst x)  = pure (Just (Fix (Const x)))
+    expandNode seen n (EUni f t) = do
+      mt <- go seen (n + 1) t
+      case mt of
+        Nothing -> pure Nothing
+        Just t' -> pure (Just (Fix (Uni f t')))
+    expandNode seen n (EBin op l r) = do
+      ml <- go seen (n + 1) l
+      case ml of
+        Nothing -> pure Nothing
+        Just l' -> do
+          mr <- go seen (n + 1) r
+          case mr of
+            Nothing -> pure Nothing
+            Just r' -> pure (Just (Fix (Bin op l' r')))
+    expandNode seen n (ENAry op m) = do
+      let children = IntMap.toAscList m
+      mts <- expandNary seen n children
+      pure $ naryTree op <$> mts
+
+    expandNary :: IntSet -> Int -> [(EClassId, Int)] -> IO (Maybe [Fix SRTree])
+    expandNary _ _ [] = pure (Just [])
+    expandNary seen n ((cid, cnt) : rest) = do
+      mc <- go seen (n + 1) cid
+      case mc of
+        Nothing -> pure Nothing
+        Just c  -> do
+          mrest <- expandNary seen (n + 1) rest
+          case mrest of
+            Nothing -> pure Nothing
+            Just rs -> pure (Just (replicate (min cnt (budget - n)) c ++ rs))
+
+    naryTree :: NOp -> [Fix SRTree] -> Fix SRTree
+    naryTree _ [] = Fix (Var 0)
+    naryTree op ts = normSubDiv (foldr1 (\a b -> Fix (Bin (toOp op) a b)) ts)
+
+    normSubDiv :: Fix SRTree -> Fix SRTree
+    normSubDiv (Fix (Bin Add l r)) = case pick l r of
+        Just (pos, neg) -> Fix (Bin Sub pos neg)
+        Nothing         -> Fix (Bin Add (normSubDiv l) (normSubDiv r))
+      where
+        pick a b = case negated a of
+                     Just t -> Just (b, t)
+                     Nothing -> case negated b of
+                                  Just t -> Just (a, t)
+                                  Nothing -> Nothing
+        negated (Fix (Bin Mul (Fix (Const c)) t)) | c == -1 = Just t
+        negated (Fix (Bin Mul t (Fix (Const c)))) | c == -1 = Just t
+        negated (Fix (Const c)) | c < 0 = Just (Fix (Const (-c)))
+        negated _ = Nothing
+    normSubDiv (Fix (Bin Mul l r)) = case pick l r of
+        Just (num, den) -> Fix (Bin Div num den)
+        Nothing         -> Fix (Bin Mul (normSubDiv l) (normSubDiv r))
+      where
+        pick a b = case a of
+                     Fix (Uni Recip t) -> Just (b, t)
+                     _ -> case b of
+                            Fix (Uni Recip t) -> Just (a, t)
+                            _ -> Nothing
+    normSubDiv (Fix (Uni f t)) = Fix (Uni f (normSubDiv t))
+    normSubDiv t = t
 
 -- | Read a single page blob for an e-class (raw binary, no decoding).
 readPage :: SqlBackend db => db -> EClassId -> IO (Maybe BL.ByteString)
