@@ -170,12 +170,10 @@ runFitData opts = do
               execDb db "COMMIT"
 
               -- Phase 4: fit survivors sequentially
-              -- SQLite WAL serializes writers across all connections, so parallel
-              -- fitting with multiple connections gains nothing over sequential.
-              -- Within-expression parallelism is handled by setMTPopParallel.
-              setMTPopParallel True
-              mapM_ (fitOne fitdataQuiet db dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter) survivors
+              -- Within-expression parallelism is enabled (multi-chunk AD evaluation).
               setMTPopParallel False
+              mapM_ (fitOne fitdataQuiet db dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter) survivors
+              setMTPopParallel True
 
               -- Reclaim WAL space (ignore errors if locked by concurrent readers)
               let tryCheckpoint = void (queryDb db "PRAGMA wal_checkpoint(PASSIVE)" [])
