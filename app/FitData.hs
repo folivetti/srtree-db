@@ -173,10 +173,10 @@ runFitData opts = do
                     hFlush stdout
                 else pure ()
 
-              -- Phase 4: parallel NLopt fit of survivors
+              -- Phase 4: fit survivors sequentially
+              -- (mapConcurrently_ cannot share a single SQLite connection across threads)
               setMTPopParallel True
-              let chunks = chunk nCaps survivors
-              void $ mapConcurrently_ (mapM_ (fitOne fitdataQuiet db dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter)) chunks
+              mapM_ (fitOne fitdataQuiet db dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter) survivors
               setMTPopParallel False
 
               execDb db "COMMIT"
