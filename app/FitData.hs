@@ -11,6 +11,7 @@ module FitData
   ) where
 
 import Control.Concurrent (getNumCapabilities)
+import Control.Concurrent.Async (forConcurrently_)
 import Control.Monad (replicateM, when, unless, void)
 import Control.Exception (bracket, SomeException, catch, SomeAsyncException(..))
 import Data.IORef
@@ -149,37 +150,44 @@ runFitData opts = do
 
               (cache1, needed) <- expandLoop cache0
 
-              -- Wrap all writes for this batch in a single transaction
+              -- Wrap sequential writes (buildJob + classify) in a transaction
               execDb db "BEGIN"
 
               -- Phase 2: build jobs (reconstruct, handle cache misses)
               let toFit = IntSet.toList needed
               mjobs <- mapM (buildJob db dsid cache1 nNoiseParams counter) toFit
-              -- Bottom-up order: smaller subtrees first so NaN discoveries propagate
               let jobs = sortBy (comparing jobSize) (catMaybes mjobs)
 
-              -- Phase 3: classify bottom-up, pruning any eclass that contains a NaN
-              -- subexpression, collecting only NLopt survivors.
+              -- Phase 3: classify bottom-up, pruning NaN, collecting survivors
               survivorRef <- newIORef ([] :: [FitJob])
               beforeNan <- readIORef nanCount
               mapM_ (classify fitdataQuiet nanSet counter nanCount survivorRef db dsid cache1 xTrain yTrain mYErr fitdataLoss nNoiseParams) jobs
               survivors <- readIORef survivorRef
               afterNan <- readIORef nanCount
-              if afterNan > beforeNan
-                then do
-                  unless fitdataQuiet $ do
-                    putStrLn $ "  +" ++ show (afterNan - beforeNan)
-                      ++ " eclasses inserted with NaN this batch (total " ++ show afterNan ++ ")"
-                    hFlush stdout
-                else pure ()
-
-              -- Phase 4: fit survivors sequentially
-              -- (mapConcurrently_ cannot share a single SQLite connection across threads)
-              setMTPopParallel True
-              mapM_ (fitOne fitdataQuiet db dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter) survivors
-              setMTPopParallel False
+              when (afterNan > beforeNan) $
+                unless fitdataQuiet $ do
+                  putStrLn $ "  +" ++ show (afterNan - beforeNan)
+                    ++ " eclasses inserted with NaN this batch (total " ++ show afterNan ++ ")"
+                  hFlush stdout
 
               execDb db "COMMIT"
+
+              -- Phase 4: parallel NLopt fit using one connection per thread
+              nCaps <- getNumCapabilities
+              let workerCount = min nCaps (max 1 (length survivors))
+              workers <- replicateM workerCount $ do
+                w <- open (T.pack fitdataDb)
+                exec w "PRAGMA journal_mode=WAL"
+                execDb w "BEGIN"
+                pure w
+              let workerChunks = chunk workerCount survivors
+              setMTPopParallel True
+              void $ forConcurrently_ (zip workers workerChunks) $ \(w, jobs') ->
+                mapM_ (fitOne fitdataQuiet w dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter) jobs'
+              setMTPopParallel False
+              mapM_ (\w -> execDb w "COMMIT") workers
+              mapM_ close workers
+
               -- Reclaim WAL space (ignore errors if locked by concurrent readers)
               let tryCheckpoint = void (queryDb db "PRAGMA wal_checkpoint(PASSIVE)" [])
               tryCheckpoint `catch` \(_ :: SomeException) -> pure ()
