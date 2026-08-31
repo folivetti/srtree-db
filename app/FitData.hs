@@ -10,8 +10,6 @@ module FitData
   , runRefit
   ) where
 
-import Control.Concurrent (getNumCapabilities)
-import Control.Concurrent.Async (forConcurrently_)
 import Control.Monad (replicateM, when, unless, void)
 import Control.Exception (bracket, SomeException, catch, SomeAsyncException(..))
 import Data.IORef
@@ -124,7 +122,6 @@ runFitData opts = do
     if total == 0
       then putStrLn "Nothing to fit."
       else do
-        nCaps <- getNumCapabilities
         counter <- newIORef (0 :: Int)
         nanSet <- newIORef IntSet.empty
         nanCount <- newIORef (0 :: Int)
@@ -172,22 +169,13 @@ runFitData opts = do
 
               execDb db "COMMIT"
 
-              -- Phase 4: parallel NLopt fit using one connection per thread
-              nCaps <- getNumCapabilities
-              let workerCount = min nCaps (max 1 (length survivors))
-              workers <- replicateM workerCount $ do
-                w <- open (T.pack fitdataDb)
-                exec w "PRAGMA journal_mode=WAL"
-                exec w "PRAGMA busy_timeout = 5000"
-                execDb w "BEGIN"
-                pure w
-              let workerChunks = chunk workerCount survivors
+              -- Phase 4: fit survivors sequentially
+              -- SQLite WAL serializes writers across all connections, so parallel
+              -- fitting with multiple connections gains nothing over sequential.
+              -- Within-expression parallelism is handled by setMTPopParallel.
               setMTPopParallel True
-              void $ forConcurrently_ (zip workers workerChunks) $ \(w, jobs') ->
-                mapM_ (fitOne fitdataQuiet w dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter) jobs'
+              mapM_ (fitOne fitdataQuiet db dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter) survivors
               setMTPopParallel False
-              mapM_ (\w -> execDb w "COMMIT") workers
-              mapM_ close workers
 
               -- Reclaim WAL space (ignore errors if locked by concurrent readers)
               let tryCheckpoint = void (queryDb db "PRAGMA wal_checkpoint(PASSIVE)" [])
