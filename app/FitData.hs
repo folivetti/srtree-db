@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module FitData
   ( FitDataOpts(..)
@@ -10,9 +11,8 @@ module FitData
   ) where
 
 import Control.Concurrent (getNumCapabilities)
-import Control.Concurrent.Async (mapConcurrently_)
 import Control.Monad (replicateM, when, unless, void)
-import Control.Exception (bracket)
+import Control.Exception (bracket, SomeException, catch, SomeAsyncException(..))
 import Data.IORef
 import Data.List (maximumBy, foldl', sortBy)
 import Data.Maybe (catMaybes)
@@ -180,9 +180,9 @@ runFitData opts = do
               setMTPopParallel False
 
               execDb db "COMMIT"
-              -- Reclaim WAL space (PASSIVE is non-blocking, safe with concurrent readers)
-              _ <- queryDb db "PRAGMA wal_checkpoint(PASSIVE)" []
-              -- cache1, nanSet updates and survivors go out of scope here — GC can reclaim
+              -- Reclaim WAL space (ignore errors if locked by concurrent readers)
+              let tryCheckpoint = void (queryDb db "PRAGMA wal_checkpoint(PASSIVE)" [])
+              tryCheckpoint `catch` \(_ :: SomeException) -> pure ()
               unless fitdataQuiet $ putStrLn "  [checkpoint] committed batch"
 
         -- Stream IDs in batches using foldQueryDb to avoid retaining full list spine
