@@ -180,6 +180,8 @@ runFitData opts = do
               setMTPopParallel False
 
               execDb db "COMMIT"
+              -- Reclaim WAL space (PASSIVE is non-blocking, safe with concurrent readers)
+              _ <- queryDb db "PRAGMA wal_checkpoint(PASSIVE)" []
               -- cache1, nanSet updates and survivors go out of scope here — GC can reclaim
               unless fitdataQuiet $ putStrLn "  [checkpoint] committed batch"
 
