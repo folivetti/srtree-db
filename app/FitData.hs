@@ -139,7 +139,8 @@ runFitData opts = do
           nanCount <- newIORef (0 :: Int)
 
           -- Phase 0-1: load pages + expand (reads from egraph DB)
-          let loadPhase batch = do
+          -- Accumulates invalid/analytical fits in an IORef (no DB writes)
+          let loadPhase pendingRef batch = do
                 let batchIds = IntSet.fromList batch
                 batchPages <- loadPagesBulk egDb (IntSet.toList batchIds)
                 let !cache0 = batchPages
@@ -157,13 +158,13 @@ runFitData opts = do
 
                 -- Phase 2: build jobs (reconstruct, handle cache misses)
                 let toFit = IntSet.toList needed
-                mjobs <- mapM (buildJob fitDb dsid cache1 nNoiseParams counter) toFit
+                mjobs <- mapM (buildJobNoWrite cache1 nNoiseParams counter pendingRef) toFit
                 let jobs = sortBy (comparing jobSize) (catMaybes mjobs)
 
                 -- Phase 3: classify bottom-up, pruning NaN, collecting survivors
                 survivorRef <- newIORef ([] :: [FitJob])
                 beforeNan <- readIORef nanCount
-                mapM_ (classify fitdataQuiet nanSet counter nanCount survivorRef fitDb dsid cache1 xTrain yTrain mYErr fitdataLoss nNoiseParams) jobs
+                mapM_ (classifyNoWrite fitdataQuiet nanSet counter nanCount survivorRef pendingRef dsid cache1 xTrain yTrain mYErr fitdataLoss nNoiseParams) jobs
                 survivors <- readIORef survivorRef
                 afterNan <- readIORef nanCount
                 when (afterNan > beforeNan) $
@@ -174,12 +175,18 @@ runFitData opts = do
                 pure survivors
 
           -- Phase 4-5: parallel NLopt + batch write (uses fitDb)
-          let fitPhase survivors = do
+          let fitPhase pendingRef survivors = do
                 let chunks = chunk nCaps survivors
-                setMTPopParallel True
-                results <- fmap concat $ mapConcurrently (mapM (fitOneNLopt fitdataQuiet xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter)) chunks
                 setMTPopParallel False
+                results <- fmap concat $ mapConcurrently (mapM (fitOneNLopt fitdataQuiet xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter)) chunks
+                setMTPopParallel True
+                -- Batch write all pending fits (invalid + analytical + NLopt)
+                pending <- atomicModifyIORef' pendingRef (\ps -> ([], ps))
                 execDb fitDb "BEGIN"
+                forM_ pending $ \(FitPending eid fit theta sz) ->
+                  case fit of
+                    Nothing -> writeInvalidFit fitDb dsid eid  -- invalid: fitted=1, fitness=NULL
+                    Just f -> writeDatasetFit fitDb dsid eid (Just f) Nothing theta sz
                 forM_ results $ \(FitResult eid fit theta sz) ->
                   writeDatasetFit fitDb dsid eid (Just fit) Nothing theta sz
                 execDb fitDb "COMMIT"
@@ -187,7 +194,8 @@ runFitData opts = do
 
           -- Collect all batches, then process with pipelining
           allBatches <- collectBatches egDb fitDb dsid fitdataBatchSize
-          processBatchesPipelined egDb fitDb nCaps loadPhase fitPhase allBatches
+          pendingRef <- newIORef ([] :: [FitPending])
+          processBatchesPipelined egDb fitDb nCaps (loadPhase pendingRef) (fitPhase pendingRef) allBatches
 
           fitted <- readIORef counter
           putStrLn $ "Fitted " ++ show fitted ++ "/" ++ show total
@@ -211,15 +219,21 @@ data FitResult = FitResult
   , frSize    :: !Int
   }
 
--- | Reconstruct a job for an eclass, writing an invalid (NULL-fitness) row and
--- counting it when the eclass cannot be reconstructed from the cache.
-buildJob :: SqlBackend db
-         => db -> Int -> IntMap.IntMap EClass -> Int -> IORef Int
-         -> EClassId -> IO (Maybe FitJob)
-buildJob db dsid cache nNoiseParams counter eid = do
+-- | A pending DB write (accumulated during loadPhase, written in fitPhase).
+data FitPending = FitPending
+  { fpEid     :: !EClassId
+  , fpFitness :: !(Maybe Double)
+  , fpTheta   :: !T.Text
+  , fpSize    :: !Int
+  }
+
+-- | Reconstruct a job, accumulating invalid writes instead of writing immediately.
+buildJobNoWrite :: IntMap.IntMap EClass -> Int -> IORef Int -> IORef [FitPending]
+                -> EClassId -> IO (Maybe FitJob)
+buildJobNoWrite cache nNoiseParams counter pendingRef eid = do
   case reconstructFromCache cache eid of
     Nothing -> do
-      writeInvalidFit db dsid eid
+      atomicModifyIORef' pendingRef (\ps -> (FitPending eid Nothing (T.pack (serializeTheta [])) 0 : ps, ()))
       atomicModifyIORef' counter (\n -> let !n' = n + 1 in (n', ()))
       pure Nothing
     Just tree -> do
@@ -229,6 +243,38 @@ buildJob db dsid cache nNoiseParams counter eid = do
           !free  = nup == 0
           !sz    = countNodes tree'
       pure (Just (FitJob eid tree' free np sz))
+
+-- | Classify without writing to DB. Accumulates pending writes.
+classifyNoWrite :: Bool -> IORef IntSet.IntSet -> IORef Int -> IORef Int
+                -> IORef [FitJob] -> IORef [FitPending]
+                -> Int -> IntMap.IntMap EClass
+                -> [VU.Vector Double] -> VU.Vector Double -> Maybe (VU.Vector Double)
+                -> Loss -> Int -> FitJob -> IO ()
+classifyNoWrite quiet nanSet counter nanCount survivorRef pendingRef dsid cache xTrain yTrain mYErr loss nNoiseParams (FitJob eid tree' free np sz) = do
+  let desc = expandTreeIds cache eid
+  nan <- readIORef nanSet
+  if not (IntSet.null (IntSet.intersection desc nan))
+    then pruneNoWrite
+    else if not free
+      then survivor
+      else do
+        let fitness = analyticalFit loss xTrain yTrain tree'
+        if isInvalid fitness
+          then pruneNoWrite
+          else if np == 0
+            then do
+              atomicModifyIORef' pendingRef (\ps -> (FitPending eid (Just fitness) (T.pack (serializeTheta [])) sz : ps, ()))
+              atomicModifyIORef' counter (\n -> let !n' = n + 1 in (n', ()))
+              unless quiet $ putStrLn $ "  eclass " ++ show eid ++ " (" ++ takeExpr tree' ++ "): fitness=" ++ showFit fitness ++ " [analytical]"
+            else survivor
+  where
+    pruneNoWrite = do
+      atomicModifyIORef' pendingRef (\ps -> (FitPending eid Nothing (T.pack (serializeTheta [])) 0 : ps, ()))
+      atomicModifyIORef' nanSet (\s -> (IntSet.insert eid s, ()))
+      atomicModifyIORef' nanCount (\n -> let !n' = n + 1 in (n', ()))
+      atomicModifyIORef' counter (\n -> let !n' = n + 1 in (n', ()))
+    survivor = do
+      atomicModifyIORef' survivorRef (\xs -> (FitJob eid tree' free np sz : xs, ()))
 
 -- | Classify a single eclass (run in bottom-up order). If the expression
 -- contains any known-NaN subexpression, or is a parameter-less expression that
