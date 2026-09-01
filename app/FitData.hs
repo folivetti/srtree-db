@@ -10,6 +10,8 @@ module FitData
   , runRefit
   ) where
 
+import Control.Concurrent (getNumCapabilities)
+import Control.Concurrent.Async (mapConcurrently_)
 import Control.Monad (replicateM, when, unless, void)
 import Control.Exception (bracket, SomeException, catch, SomeAsyncException(..))
 import Data.IORef
@@ -122,6 +124,7 @@ runFitData opts = do
     if total == 0
       then putStrLn "Nothing to fit."
       else do
+        nCaps <- getNumCapabilities
         counter <- newIORef (0 :: Int)
         nanSet <- newIORef IntSet.empty
         nanCount <- newIORef (0 :: Int)
@@ -169,15 +172,21 @@ runFitData opts = do
 
               execDb db "COMMIT"
 
-              -- Phase 4: fit survivors sequentially
-              -- Within-expression parallelism is enabled (multi-chunk AD evaluation).
-              setMTPopParallel False
-              mapM_ (fitOne fitdataQuiet db dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter) survivors
+              -- Phase 4: parallel NLopt fit
+              -- GHC green threads serialize SQLite IO naturally; within-expression
+              -- parallelism is disabled (setMTPopParallel True) to avoid oversubscription.
+              let chunks = chunk nCaps survivors
               setMTPopParallel True
+              void $ mapConcurrently_ (mapM_ (fitOne fitdataQuiet db dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter)) chunks
+              setMTPopParallel False
 
-              -- Reclaim WAL space (ignore errors if locked by concurrent readers)
-              let tryCheckpoint = void (queryDb db "PRAGMA wal_checkpoint(PASSIVE)" [])
-              tryCheckpoint `catch` \(_ :: SomeException) -> pure ()
+              -- Reclaim WAL space using a dedicated connection (avoids locking
+              -- conflicts with the main connection or concurrent readers).
+              bracket (open (T.pack fitdataDb)) close $ \ck -> do
+                exec ck "PRAGMA journal_mode=WAL"
+                exec ck "PRAGMA busy_timeout = 10000"
+                _ <- queryDb ck "PRAGMA wal_checkpoint(TRUNCATE)" []
+                pure ()
               unless fitdataQuiet $ putStrLn "  [checkpoint] committed batch"
 
         -- Stream IDs in batches using foldQueryDb to avoid retaining full list spine
