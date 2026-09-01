@@ -11,8 +11,8 @@ module FitData
   ) where
 
 import Control.Concurrent (getNumCapabilities, threadDelay)
-import Control.Concurrent.Async (mapConcurrently_)
-import Control.Monad (replicateM, when, unless, void)
+import Control.Concurrent.Async (mapConcurrently_, mapConcurrently, async, wait)
+import Control.Monad (replicateM, when, unless, void, forM_)
 import Control.Exception (bracket, SomeException, catch, SomeAsyncException(..))
 import Data.IORef
 import Data.List (maximumBy, foldl', sortBy)
@@ -138,14 +138,11 @@ runFitData opts = do
           nanSet <- newIORef IntSet.empty
           nanCount <- newIORef (0 :: Int)
 
-          let processBatch [] = pure ()
-              processBatch batch = do
-                -- Phase 0: load batch root eclasses into a fresh local cache
+          -- Phase 0-1: load pages + expand (reads from egraph DB)
+          let loadPhase batch = do
                 let batchIds = IntSet.fromList batch
                 batchPages <- loadPagesBulk egDb (IntSet.toList batchIds)
                 let !cache0 = batchPages
-
-                -- Phase 1: iteratively expand until all transitive sub-classes are loaded
                 let expandLoop !cache = do
                       let needed = foldl' (\s eid -> s `IntSet.union` expandTreeIds cache eid) IntSet.empty batch
                           missing = IntSet.toList (IntSet.difference needed (IntSet.fromList (IntMap.keys cache)))
@@ -156,11 +153,7 @@ runFitData opts = do
                           hFlush stdout
                           newPages <- loadPagesBulk egDb missing
                           expandLoop (cache `IntMap.union` newPages)
-
                 (cache1, needed) <- expandLoop cache0
-
-                -- Wrap sequential writes (buildJob + classify) in a transaction
-                execDb fitDb "BEGIN"
 
                 -- Phase 2: build jobs (reconstruct, handle cache misses)
                 let toFit = IntSet.toList needed
@@ -178,19 +171,23 @@ runFitData opts = do
                     putStrLn $ "  +" ++ show (afterNan - beforeNan)
                       ++ " eclasses inserted with NaN this batch (total " ++ show afterNan ++ ")"
                     hFlush stdout
+                pure survivors
 
-                execDb fitDb "COMMIT"
-
-                -- Phase 4: parallel NLopt fit
+          -- Phase 4-5: parallel NLopt + batch write (uses fitDb)
+          let fitPhase survivors = do
                 let chunks = chunk nCaps survivors
                 setMTPopParallel True
-                void $ mapConcurrently_ (mapM_ (fitOne fitdataQuiet fitDb dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter)) chunks
+                results <- fmap concat $ mapConcurrently (mapM (fitOneNLopt fitdataQuiet xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter)) chunks
                 setMTPopParallel False
-
+                execDb fitDb "BEGIN"
+                forM_ results $ \(FitResult eid fit theta sz) ->
+                  writeDatasetFit fitDb dsid eid (Just fit) Nothing theta sz
+                execDb fitDb "COMMIT"
                 unless fitdataQuiet $ putStrLn "  [checkpoint] committed batch"
 
-          -- Stream IDs in batches (cross-DB: egraph + fit)
-          processStreamingBatches egDb fitDb dsid fitdataBatchSize processBatch
+          -- Collect all batches, then process with pipelining
+          allBatches <- collectBatches egDb fitDb dsid fitdataBatchSize
+          processBatchesPipelined egDb fitDb nCaps loadPhase fitPhase allBatches
 
           fitted <- readIORef counter
           putStrLn $ "Fitted " ++ show fitted ++ "/" ++ show total
@@ -204,6 +201,14 @@ data FitJob = FitJob
   , jobFree  :: !Bool        -- ^ structurally parameter-free (no Param nodes)
   , jobNp    :: !Int         -- ^ total free params incl. loss noise params
   , jobSize  :: !Int
+  }
+
+-- | Result of fitting one expression (pure data, no DB side effects).
+data FitResult = FitResult
+  { frEid     :: !EClassId
+  , frFitness :: !Double
+  , frTheta   :: !T.Text
+  , frSize    :: !Int
   }
 
 -- | Reconstruct a job for an eclass, writing an invalid (NULL-fitness) row and
@@ -269,11 +274,20 @@ classify quiet nanSet counter nanCount survivorRef db dsid cache xTrain yTrain m
 
 -- | Fit one expression via NLopt. Only called on survivors that are not
 -- statically NaN. Runs @nRep@ restarts and keeps the best.
+-- Writes result to DB immediately.
 fitOne :: SqlBackend db
        => Bool -> db -> Int
        -> [VU.Vector Double] -> VU.Vector Double -> Maybe (VU.Vector Double)
        -> Loss -> Int -> Int -> IORef Int -> FitJob -> IO ()
-fitOne quiet db dsid xTrain yTrain mYErr loss nIter nRep counter (FitJob eid tree' _ np sz) = do
+fitOne quiet db dsid xTrain yTrain mYErr loss nIter nRep counter job = do
+  fr <- fitOneNLopt quiet xTrain yTrain mYErr loss nIter nRep counter job
+  writeDatasetFit db dsid (frEid fr) (Just (frFitness fr)) Nothing (frTheta fr) (frSize fr)
+
+-- | Pure NLopt fit (no DB side effects). Returns a FitResult.
+fitOneNLopt :: Bool
+            -> [VU.Vector Double] -> VU.Vector Double -> Maybe (VU.Vector Double)
+            -> Loss -> Int -> Int -> IORef Int -> FitJob -> IO FitResult
+fitOneNLopt quiet xTrain yTrain mYErr loss nIter nRep counter (FitJob eid tree' _ np sz) = do
   let funAndGrad = compileLossAndGrad MultiThread loss mYErr xTrain yTrain tree'
       runRestart = do
         theta0 <- VU.replicateM np (randomRIO (-1, 1))
@@ -281,10 +295,10 @@ fitOne quiet db dsid xTrain yTrain mYErr loss nIter nRep counter (FitJob eid tre
         pure (negate lossVal, theta)
   results <- replicateM nRep runRestart
   let (bestFitness, bestTheta) = maximumBy (comparing fst) results
-  writeDatasetFit db dsid eid (Just bestFitness) Nothing
-    (T.pack (serializeTheta [bestTheta])) sz
+      !thetaText = T.pack (serializeTheta [bestTheta])
   atomicModifyIORef' counter (\n -> let !n' = n + 1 in (n', ()))
   unless quiet $ putStrLn $ "  eclass " ++ show eid ++ " (" ++ takeExpr tree' ++ "): fitness=" ++ showFit bestFitness
+  pure (FitResult eid bestFitness thetaText sz)
 
 -- | Whether a fitness value is unusable (NaN or +/-Infinity), so it can be
 -- pruned and propagated to ancestors.
@@ -378,6 +392,76 @@ processStreamingBatches egDb fitDb dsid batchSize processBatch = do
       _ -> pure ())
   remaining <- readIORef batchRef
   when (not (null remaining)) $ processBatch (reverse remaining)
+
+-- | Collect all unfitted batch IDs into a list of batches.
+collectBatches :: (SqlBackend db1, SqlBackend db2)
+               => db1 -> db2 -> Int -> Int -> IO [[EClassId]]
+collectBatches egDb fitDb dsid batchSize = do
+  fittedSet <- loadFittedSet fitDb dsid
+  batchesRef <- newIORef ([] :: [[EClassId]])
+  batchRef <- newIORef ([] :: [EClassId])
+  countRef <- newIORef (0 :: Int)
+  foldQueryDb egDb
+    "SELECT eid FROM eclass ORDER BY eid"
+    []
+    ()
+    (\() cols -> case cols of
+      [eidCol] -> do
+        let !eid = sqlToInt eidCol
+        if IntSet.member eid fittedSet
+          then pure ()
+          else do
+            batch <- readIORef batchRef
+            let !batch' = eid : batch
+            n <- readIORef countRef
+            let !n' = n + 1
+            writeIORef countRef n'
+            if n' >= batchSize
+              then do
+                modifyIORef' batchesRef (reverse batch' :)
+                writeIORef batchRef []
+                writeIORef countRef 0
+              else writeIORef batchRef batch'
+        pure ()
+      _ -> pure ())
+  remaining <- readIORef batchRef
+  when (not (null remaining)) $ modifyIORef' batchesRef (reverse remaining :)
+  allBatches <- readIORef batchesRef
+  pure (reverse allBatches)
+
+-- | Process batches with pipelining: while batch K's Phase 4 (NLopt) runs,
+-- batch K+1's Phase 0-1 (loading) starts in the background.
+-- Hides I/O latency behind compute.
+processBatchesPipelined :: (SqlBackend db1, SqlBackend db2)
+                        => db1 -> db2 -> Int
+                        -> ([EClassId] -> IO [FitJob])
+                        -> ([FitJob] -> IO ())
+                        -> [[EClassId]]
+                        -> IO ()
+processBatchesPipelined _ _ _ _ _ [] = pure ()
+processBatchesPipelined egDb fitDb nCaps loadPhase fitPhase [batch] = do
+  survivors <- loadPhase batch
+  fitPhase survivors
+processBatchesPipelined egDb fitDb nCaps loadPhase fitPhase (batch:rest) = do
+  -- Start loading next batch in background
+  nextLoad <- async $ loadPhase (head rest)
+  -- Load and fit current batch
+  survivors <- loadPhase batch
+  fitPhase survivors
+  -- Wait for next load, then continue
+  processBatchesPipelined' nextLoad rest
+  where
+    processBatchesPipelined' prevLoad [] = do
+      survivors <- wait prevLoad
+      fitPhase survivors
+    processBatchesPipelined' prevLoad [b] = do
+      survivors <- wait prevLoad
+      fitPhase survivors
+    processBatchesPipelined' prevLoad (b:bs) = do
+      nextLoad <- async $ loadPhase b
+      survivors <- wait prevLoad
+      fitPhase survivors
+      processBatchesPipelined' nextLoad bs
 
 chunk :: Int -> [a] -> [[a]]
 chunk _ [] = []
