@@ -13,7 +13,8 @@
 -- 'closePostgres'); the reggression layer dispatches on a @postgres://@ /
 -- @postgresql://@ DSN.
 module Algorithm.EqSat.Storage.Postgres
-  ( schemaPostgres
+  ( schemaEgraphPostgres
+  , schemaFitPostgres
   , connectPostgres
   , closePostgres
   ) where
@@ -32,14 +33,14 @@ import Database.PostgreSQL.LibPQ
 
 import Algorithm.EqSat.Storage.Backend (SqlValue(..), SqlBackend(..), sqlToInt, sqlToText)
 
--- | PostgreSQL DDL. Mirrors 'Algorithm.EqSat.Storage.Schema.schemaSQL'.
+-- | PostgreSQL DDL for the egraph section.
 --
 -- Differences from SQLite: @BIGINT@ identity keys, @DOUBLE PRECISION@
 -- metrics, and foreign keys declared @DEFERRABLE INITIALLY DEFERRED@ so the
 -- writer can insert @eclass_node@/@fit@ rows before their referenced
 -- @eclass@ rows within the @BEGIN@..@COMMIT@ transaction of 'saveGraph'.
-schemaPostgres :: [Text]
-schemaPostgres =
+schemaEgraphPostgres :: [Text]
+schemaEgraphPostgres =
   [ "CREATE TABLE IF NOT EXISTS meta ("
     <> " key TEXT PRIMARY KEY,"
     <> " value TEXT NOT NULL)"
@@ -69,13 +70,18 @@ schemaPostgres =
   , "CREATE TABLE IF NOT EXISTS frontier ("
     <> " eid BIGINT PRIMARY KEY REFERENCES eclass(eid) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,"
     <> " updated_at TEXT)"
-  , "CREATE TABLE IF NOT EXISTS dataset ("
+  ]
+
+-- | PostgreSQL DDL for a per-dataset fit DB (no FK to eclass).
+schemaFitPostgres :: [Text]
+schemaFitPostgres =
+  [ "CREATE TABLE IF NOT EXISTS dataset ("
     <> " id BIGSERIAL PRIMARY KEY,"
     <> " name TEXT NOT NULL UNIQUE,"
     <> " created TEXT)"
   , "CREATE TABLE IF NOT EXISTS dataset_fit ("
     <> " dataset_id BIGINT NOT NULL REFERENCES dataset(id) ON DELETE CASCADE,"
-    <> " eid BIGINT NOT NULL REFERENCES eclass(eid) ON DELETE CASCADE,"
+    <> " eid BIGINT NOT NULL,"
     <> " fitness DOUBLE PRECISION,"
     <> " dl DOUBLE PRECISION,"
     <> " theta TEXT,"
@@ -87,7 +93,7 @@ schemaPostgres =
     <> " PRIMARY KEY (dataset_id, eid))"
   , "CREATE TABLE IF NOT EXISTS expression_index ("
     <> " expression_key TEXT PRIMARY KEY,"
-    <> " eclass BIGINT NOT NULL REFERENCES eclass(eid) ON DELETE CASCADE,"
+    <> " eclass BIGINT NOT NULL,"
     <> " dataset_id BIGINT REFERENCES dataset(id) ON DELETE CASCADE,"
     <> " first_seen TEXT)"
   ]
@@ -157,7 +163,8 @@ instance SqlBackend Connection where
         statusOK r "foldQuery"
         pure seed0
 
-  createSchemaDb conn = mapM_ (execDb conn) schemaPostgres
+  createSchemaDb conn = mapM_ (execDb conn) schemaEgraphPostgres
+  createSchemaDbFit conn = mapM_ (execDb conn) schemaFitPostgres
 
   -- Grid fallback (Postgres is not the out-of-core target): the cursor-based
   -- streaming matcher needs 'Database.SQLite3'; here we return the full

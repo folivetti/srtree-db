@@ -40,28 +40,34 @@ import Algorithm.EqSat.Storage.Backend (SqlBackend(..), SqlValue(..), sqlToInt)
 import Algorithm.EqSat.Storage.Extract (reconstructFromCache, expandTreeIds)
 import Algorithm.EqSat.Storage.SQLite (loadPagesBulk)
 import Algorithm.EqSat.Storage.Query (getOrCreateDataset, writeDatasetFit)
+import Algorithm.EqSat.Storage.Schema (createSchemaFit)
 import Algorithm.EqSat.Storage.Types (serializeTheta)
 import Database.SQLite3 (Database, open, close, exec)
 
 -- | CLI options for the fitdata sub-command.
 data FitDataOpts = FitDataOpts
-  { fitdataDb        :: String
-  , fitdataDataset   :: String
-  , fitdataData      :: String
-  , fitdataLoss      :: Loss
-  , fitdataHasHeader :: Bool
-  , fitdataNRep      :: Int
-  , fitdataNIter     :: Int
-  , fitdataBatchSize :: Int
-  , fitdataQuiet     :: Bool
+  { fitdataEgraph      :: String
+  , fitdataFitdb       :: String
+  , fitdataDataset     :: String
+  , fitdataData        :: String
+  , fitdataLoss        :: Loss
+  , fitdataHasHeader   :: Bool
+  , fitdataNRep        :: Int
+  , fitdataNIter       :: Int
+  , fitdataBatchSize   :: Int
+  , fitdataQuiet       :: Bool
   } deriving (Show)
 
 fitdataParser :: Parser FitDataOpts
 fitdataParser = FitDataOpts
   <$> strOption
-      ( long "db"
+      ( long "egraph"
       <> metavar "FILE"
-      <> help "SQLite database file path" )
+      <> help "Path to e-graph database" )
+  <*> strOption
+      ( long "fitdb"
+      <> metavar "FILE"
+      <> help "Path to fit database" )
   <*> strOption
       ( long "dataset"
       <> metavar "NAME"
@@ -112,84 +118,83 @@ runFitData opts = do
         NLL ROXY     -> 3
         _            -> 0
 
-  putStrLn $ "Opening " ++ fitdataDb ++ "..."
+  putStrLn $ "Opening egraph: " ++ fitdataEgraph ++ "..."
+  putStrLn $ "Opening fitdb: " ++ fitdataFitdb ++ "..."
   hFlush stdout
-  withSQLite fitdataDb $ \db -> do
-    dsid <- getOrCreateDataset db fitdataDataset
+  withSQLite fitdataFitdb $ \fitDb -> do
+    createSchemaFit fitDb
+    withSQLite fitdataEgraph $ \egDb -> do
+      dsid <- getOrCreateDataset fitDb fitdataDataset
 
-    total <- countUnfitted db dsid
-    putStrLn $ "Found " ++ show total ++ " unfitted e-classes"
-    hFlush stdout
+      total <- countUnfitted egDb fitDb dsid
+      putStrLn $ "Found " ++ show total ++ " unfitted e-classes"
+      hFlush stdout
 
-    if total == 0
-      then putStrLn "Nothing to fit."
-      else do
-        nCaps <- getNumCapabilities
-        counter <- newIORef (0 :: Int)
-        nanSet <- newIORef IntSet.empty
-        nanCount <- newIORef (0 :: Int)
+      if total == 0
+        then putStrLn "Nothing to fit."
+        else do
+          nCaps <- getNumCapabilities
+          counter <- newIORef (0 :: Int)
+          nanSet <- newIORef IntSet.empty
+          nanCount <- newIORef (0 :: Int)
 
-        let processBatch [] = pure ()
-            processBatch batch = do
-              -- Phase 0: load batch root eclasses into a fresh local cache
-              let batchIds = IntSet.fromList batch
-              batchPages <- loadPagesBulk db (IntSet.toList batchIds)
-              let !cache0 = batchPages
+          let processBatch [] = pure ()
+              processBatch batch = do
+                -- Phase 0: load batch root eclasses into a fresh local cache
+                let batchIds = IntSet.fromList batch
+                batchPages <- loadPagesBulk egDb (IntSet.toList batchIds)
+                let !cache0 = batchPages
 
-              -- Phase 1: iteratively expand until all transitive sub-classes are loaded
-              let expandLoop !cache = do
-                    let needed = foldl' (\s eid -> s `IntSet.union` expandTreeIds cache eid) IntSet.empty batch
-                        missing = IntSet.toList (IntSet.difference needed (IntSet.fromList (IntMap.keys cache)))
-                    if null missing
-                      then pure (cache, needed)
-                      else do
-                        putStrLn $ "  Loading " ++ show (length missing) ++ " sub-expression pages..."
-                        hFlush stdout
-                        newPages <- loadPagesBulk db missing
-                        expandLoop (cache `IntMap.union` newPages)
+                -- Phase 1: iteratively expand until all transitive sub-classes are loaded
+                let expandLoop !cache = do
+                      let needed = foldl' (\s eid -> s `IntSet.union` expandTreeIds cache eid) IntSet.empty batch
+                          missing = IntSet.toList (IntSet.difference needed (IntSet.fromList (IntMap.keys cache)))
+                      if null missing
+                        then pure (cache, needed)
+                        else do
+                          putStrLn $ "  Loading " ++ show (length missing) ++ " sub-expression pages..."
+                          hFlush stdout
+                          newPages <- loadPagesBulk egDb missing
+                          expandLoop (cache `IntMap.union` newPages)
 
-              (cache1, needed) <- expandLoop cache0
+                (cache1, needed) <- expandLoop cache0
 
-              -- Wrap sequential writes (buildJob + classify) in a transaction
-              execDb db "BEGIN"
+                -- Wrap sequential writes (buildJob + classify) in a transaction
+                execDb fitDb "BEGIN"
 
-              -- Phase 2: build jobs (reconstruct, handle cache misses)
-              let toFit = IntSet.toList needed
-              mjobs <- mapM (buildJob db dsid cache1 nNoiseParams counter) toFit
-              let jobs = sortBy (comparing jobSize) (catMaybes mjobs)
+                -- Phase 2: build jobs (reconstruct, handle cache misses)
+                let toFit = IntSet.toList needed
+                mjobs <- mapM (buildJob fitDb dsid cache1 nNoiseParams counter) toFit
+                let jobs = sortBy (comparing jobSize) (catMaybes mjobs)
 
-              -- Phase 3: classify bottom-up, pruning NaN, collecting survivors
-              survivorRef <- newIORef ([] :: [FitJob])
-              beforeNan <- readIORef nanCount
-              mapM_ (classify fitdataQuiet nanSet counter nanCount survivorRef db dsid cache1 xTrain yTrain mYErr fitdataLoss nNoiseParams) jobs
-              survivors <- readIORef survivorRef
-              afterNan <- readIORef nanCount
-              when (afterNan > beforeNan) $
-                unless fitdataQuiet $ do
-                  putStrLn $ "  +" ++ show (afterNan - beforeNan)
-                    ++ " eclasses inserted with NaN this batch (total " ++ show afterNan ++ ")"
-                  hFlush stdout
+                -- Phase 3: classify bottom-up, pruning NaN, collecting survivors
+                survivorRef <- newIORef ([] :: [FitJob])
+                beforeNan <- readIORef nanCount
+                mapM_ (classify fitdataQuiet nanSet counter nanCount survivorRef fitDb dsid cache1 xTrain yTrain mYErr fitdataLoss nNoiseParams) jobs
+                survivors <- readIORef survivorRef
+                afterNan <- readIORef nanCount
+                when (afterNan > beforeNan) $
+                  unless fitdataQuiet $ do
+                    putStrLn $ "  +" ++ show (afterNan - beforeNan)
+                      ++ " eclasses inserted with NaN this batch (total " ++ show afterNan ++ ")"
+                    hFlush stdout
 
-              execDb db "COMMIT"
+                execDb fitDb "COMMIT"
 
-              -- Phase 4: parallel NLopt fit
-              let chunks = chunk nCaps survivors
-              setMTPopParallel True
-              void $ mapConcurrently_ (mapM_ (fitOne fitdataQuiet db dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter)) chunks
-              setMTPopParallel False
+                -- Phase 4: parallel NLopt fit
+                let chunks = chunk nCaps survivors
+                setMTPopParallel True
+                void $ mapConcurrently_ (mapM_ (fitOne fitdataQuiet fitDb dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter)) chunks
+                setMTPopParallel False
 
-              unless fitdataQuiet $ putStrLn "  [checkpoint] committed batch"
+                unless fitdataQuiet $ putStrLn "  [checkpoint] committed batch"
 
-        -- Stream IDs in batches using foldQueryDb to avoid retaining full list spine
-        processStreamingBatches db dsid fitdataBatchSize processBatch
+          -- Stream IDs in batches (cross-DB: egraph + fit)
+          processStreamingBatches egDb fitDb dsid fitdataBatchSize processBatch
 
-        -- Final checkpoint: close and reopen to force WAL truncation
-        putStrLn "  Flushing WAL..."
-        hFlush stdout
-
-        fitted <- readIORef counter
-        putStrLn $ "Fitted " ++ show fitted ++ "/" ++ show total
-                 ++ " expressions"
+          fitted <- readIORef counter
+          putStrLn $ "Fitted " ++ show fitted ++ "/" ++ show total
+                   ++ " expressions"
 
 -- | A unit of NLopt work: a reconstructed, relabeled expression with its
 -- parameter count and node size precomputed.
@@ -318,49 +323,59 @@ analyticalFit loss xTrain yTrain tree =
       let mse = VU.sum (VU.map (\r -> r * r) residuals) / m
       in negate mse  -- fallback: use MSE
 
--- | Count unfitted e-classes for a dataset.
-countUnfitted :: SqlBackend db => db -> Int -> IO Int
-countUnfitted db dsid = do
-  rows <- queryDb db
-    "SELECT COUNT(*) FROM eclass e \
-    \LEFT JOIN dataset_fit df ON df.eid = e.eid AND df.dataset_id = ? \
-    \WHERE df.fitted IS NULL OR df.fitted = 0"
+-- | Count unfitted e-classes for a dataset (cross-DB: egraph + fit).
+countUnfitted :: (SqlBackend db1, SqlBackend db2) => db1 -> db2 -> Int -> IO Int
+countUnfitted egDb fitDb dsid = do
+  -- Total eclasses in egraph
+  totalRows <- queryDb egDb "SELECT COUNT(*) FROM eclass" []
+  let totalEclasses = case totalRows of { [[cnt]] -> sqlToInt cnt; _ -> 0 }
+  -- Fitted eclasses in fit DB
+  fittedRows <- queryDb fitDb
+    "SELECT COUNT(*) FROM dataset_fit WHERE dataset_id = ? AND fitted = 1"
     [SqlInteger (fromIntegral dsid)]
-  case rows of
-    [[cnt]] -> pure (sqlToInt cnt)
-    _       -> pure 0
+  let totalFitted = case fittedRows of { [[cnt]] -> sqlToInt cnt; _ -> 0 }
+  pure (totalEclasses - totalFitted)
+
+-- | Load all fitted eclass IDs for a dataset into an IntSet.
+loadFittedSet :: SqlBackend db => db -> Int -> IO IntSet.IntSet
+loadFittedSet fitDb dsid = do
+  rows <- queryDb fitDb
+    "SELECT eid FROM dataset_fit WHERE dataset_id = ? AND fitted = 1"
+    [SqlInteger (fromIntegral dsid)]
+  pure $ IntSet.fromList [ sqlToInt eid | [eid] <- rows ]
 
 -- | Stream unfitted e-class IDs in batches, processing each batch
 -- without materializing the full ID list in memory.
-processStreamingBatches :: SqlBackend db
-                        => db -> Int -> Int -> ([EClassId] -> IO ()) -> IO ()
-processStreamingBatches db dsid batchSize processBatch = do
+-- Cross-DB: streams from egraph, filters against fit DB.
+processStreamingBatches :: (SqlBackend db1, SqlBackend db2)
+                        => db1 -> db2 -> Int -> Int -> ([EClassId] -> IO ()) -> IO ()
+processStreamingBatches egDb fitDb dsid batchSize processBatch = do
+  fittedSet <- loadFittedSet fitDb dsid
   batchRef <- newIORef ([] :: [EClassId])
   countRef <- newIORef (0 :: Int)
-  foldQueryDb db
-    "SELECT e.eid FROM eclass e \
-    \LEFT JOIN dataset_fit df ON df.eid = e.eid AND df.dataset_id = ? \
-    \WHERE df.fitted IS NULL OR df.fitted = 0 \
-    \ORDER BY e.eid ASC"
-    [SqlInteger (fromIntegral dsid)]
+  foldQueryDb egDb
+    "SELECT eid FROM eclass ORDER BY eid"
+    []
     ()
     (\() cols -> case cols of
-      [eid] -> do
-        let !eid' = sqlToInt eid
-        batch <- readIORef batchRef
-        let !batch' = eid' : batch
-        n <- readIORef countRef
-        let !n' = n + 1
-        writeIORef countRef n'
-        if n' >= batchSize
-          then do
-            processBatch (reverse batch')
-            writeIORef batchRef []
-            writeIORef countRef 0
-          else writeIORef batchRef batch'
+      [eidCol] -> do
+        let !eid = sqlToInt eidCol
+        if IntSet.member eid fittedSet
+          then pure ()
+          else do
+            batch <- readIORef batchRef
+            let !batch' = eid : batch
+            n <- readIORef countRef
+            let !n' = n + 1
+            writeIORef countRef n'
+            if n' >= batchSize
+              then do
+                processBatch (reverse batch')
+                writeIORef batchRef []
+                writeIORef countRef 0
+              else writeIORef batchRef batch'
         pure ()
       _ -> pure ())
-  -- Process remaining
   remaining <- readIORef batchRef
   when (not (null remaining)) $ processBatch (reverse remaining)
 
@@ -386,6 +401,7 @@ withSQLite path f = bracket openDb close f
   where
     openDb = do
       db <- open (T.pack path)
+      exec db "PRAGMA journal_mode=DELETE"
       exec db "PRAGMA busy_timeout = 30000"
       pure db
 
@@ -396,9 +412,10 @@ runRefit opts = do
   putStrLn $ "Refitting dataset: " ++ fitdataDataset
   putStrLn $ "Clearing previous fit data..."
   hFlush stdout
-  withSQLite fitdataDb $ \db -> do
-    dsid <- getOrCreateDataset db fitdataDataset
-    runDb db "DELETE FROM dataset_fit WHERE dataset_id = ?" [SqlInteger (fromIntegral dsid)]
+  withSQLite fitdataFitdb $ \fitDb -> do
+    createSchemaFit fitDb
+    dsid <- getOrCreateDataset fitDb fitdataDataset
+    runDb fitDb "DELETE FROM dataset_fit WHERE dataset_id = ?" [SqlInteger (fromIntegral dsid)]
     putStrLn $ "Cleared fit data for dataset " ++ show dsid ++ "."
     hFlush stdout
   -- Now run the normal fitdata flow

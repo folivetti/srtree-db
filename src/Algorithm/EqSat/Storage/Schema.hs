@@ -2,29 +2,30 @@
 
 -- | Schema for persisting srtree e-graphs.
 --
--- Layout (shared by the SQLite and PostgreSQL backends):
---   * @meta@      - scalar settings (@next_id@, @track_dbs@, cost-function tag)
---   * @enode@     - content-addressable e-nodes (@key@ = canonical serialization)
---   * @enode_child@ - ENAry multiset children (@child_eid@, @cnt@)
---   * @eclass@    - e-class id -> canonical representative + height
---   * @eclass_node@ - canonical e-node -> e-class membership
---   * @cstore_page@ - lazily paged e-class blobs (authoritative body store)
---   * @dataset_fit@ - per-dataset per-class risk metrics
+-- Two logical sections, potentially in separate DB files:
+--   * E-graph section (dataset-agnostic, read-only during fitting):
+--     @meta@, @enode@, @enode_child@, @eclass@, @eclass_node@,
+--     @cstore_page@, @frontier@
+--   * Dataset-fit section (per-dataset, write-heavy during fitting):
+--     @dataset@, @dataset_fit@, @expression_index@
 --
--- 'schemaSQL' is the SQLite DDL; 'Algorithm.EqSat.Storage.Postgres' carries
--- the equivalent PostgreSQL DDL (identity keys, deferred FK checks,
--- @DOUBLE PRECISION@).
+-- 'egraphSchemaSQL' is the DDL for the egraph DB.
+-- 'fitSchemaSQL' is the DDL for a per-dataset fit DB (no FK to eclass).
 module Algorithm.EqSat.Storage.Schema
-  ( schemaSQL
+  ( egraphSchemaSQL
+  , fitSchemaSQL
   , createSchema
+  , createSchemaFit
   ) where
 
 import Data.Text (Text)
 
 import Algorithm.EqSat.Storage.Backend (SqlBackend(..))
 
-schemaSQL :: [Text]
-schemaSQL =
+-- | DDL for the egraph database.
+-- Full schema including dataset tables for backward compatibility with importEqs.
+egraphSchemaSQL :: [Text]
+egraphSchemaSQL =
   [ "CREATE TABLE IF NOT EXISTS meta ("
     <> " key TEXT PRIMARY KEY,"
     <> " value TEXT NOT NULL)"
@@ -77,6 +78,37 @@ schemaSQL =
     <> " first_seen TEXT)"
   ]
 
--- | Create (or ensure) the schema on the given backend.
+-- | DDL for a per-dataset fit database.
+-- No FK to eclass (e-graph lives in a separate DB).
+fitSchemaSQL :: [Text]
+fitSchemaSQL =
+  [ "CREATE TABLE IF NOT EXISTS dataset ("
+    <> " id INTEGER PRIMARY KEY,"
+    <> " name TEXT NOT NULL UNIQUE,"
+    <> " created TEXT)"
+  , "CREATE TABLE IF NOT EXISTS dataset_fit ("
+    <> " dataset_id INTEGER NOT NULL REFERENCES dataset(id) ON DELETE CASCADE,"
+    <> " eid INTEGER NOT NULL,"
+    <> " fitness REAL,"
+    <> " dl REAL,"
+    <> " theta TEXT,"
+    <> " size INTEGER NOT NULL DEFAULT 0,"
+    <> " evaluated INTEGER NOT NULL DEFAULT 0,"
+    <> " fitted INTEGER NOT NULL DEFAULT 0,"
+    <> " stale INTEGER NOT NULL DEFAULT 0,"
+    <> " updated_at TEXT,"
+    <> " PRIMARY KEY (dataset_id, eid))"
+  , "CREATE TABLE IF NOT EXISTS expression_index ("
+    <> " expression_key TEXT PRIMARY KEY,"
+    <> " eclass INTEGER NOT NULL,"
+    <> " dataset_id INTEGER REFERENCES dataset(id) ON DELETE CASCADE,"
+    <> " first_seen TEXT)"
+  ]
+
+-- | Create (or ensure) the egraph schema on the given backend.
 createSchema :: SqlBackend db => db -> IO ()
 createSchema = createSchemaDb
+
+-- | Create (or ensure) the fit schema on the given backend.
+createSchemaFit :: SqlBackend db => db -> IO ()
+createSchemaFit = createSchemaDbFit

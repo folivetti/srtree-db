@@ -69,7 +69,7 @@ import Algorithm.EqSat.Storage.ClassStore
 import Algorithm.EqSat.Storage.Query (readDatasetFit, writeDatasetFit, firstDatasetId)
 import Algorithm.EqSat.Storage.Stream (streamRootsByOp)
 import Algorithm.EqSat.Storage.Types
-import Algorithm.EqSat.Storage.Schema (createSchema, schemaSQL)
+import Algorithm.EqSat.Storage.Schema (egraphSchemaSQL, fitSchemaSQL, createSchema, createSchemaFit)
 
 -- | Default cache capacity (pages) for the lazily paged e-class store.
 -- Kept small: the cache is an LRU of deserialized EClass objects (each with
@@ -137,7 +137,8 @@ instance SqlBackend Database where
                                     _                    -> BS.empty
             k eid blob
             go stmt
-  createSchemaDb db = mapM_ (exec db) schemaSQL
+  createSchemaDb db = mapM_ (exec db) egraphSchemaSQL
+  createSchemaDbFit db = mapM_ (exec db) fitSchemaSQL
 
 toSqlData :: SqlValue -> SQLData
 toSqlData (SqlInteger n) = SQLInteger n

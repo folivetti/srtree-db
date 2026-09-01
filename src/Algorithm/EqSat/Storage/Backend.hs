@@ -75,8 +75,10 @@ class SqlBackend db where
   -- implement this; others fall back to a grid 'queryDb' (unbounded, documented).
   -- The blob is delivered hex-decoded (raw) to the callback.
   streamPages :: db -> Text -> (Int64 -> BS.ByteString -> IO ()) -> IO ()
-  -- | Create the schema (tables, indexes) for this driver.
+  -- | Create the egraph schema (tables, indexes) for this driver.
   createSchemaDb :: db -> IO ()
+  -- | Create the fit dataset schema (tables, indexes) for this driver.
+  createSchemaDbFit :: db -> IO ()
 
 sqlToInt :: SqlValue -> Int
 sqlToInt (SqlInteger n) = fromIntegral n
