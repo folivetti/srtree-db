@@ -11,7 +11,7 @@ module FitData
   ) where
 
 import Control.Concurrent (getNumCapabilities)
-import Control.Concurrent.Async (forConcurrently_)
+import Control.Concurrent.Async (mapConcurrently_)
 import Control.Monad (replicateM, when, unless, void)
 import Control.Exception (bracket, SomeException, catch, SomeAsyncException(..))
 import Data.IORef
@@ -172,27 +172,13 @@ runFitData opts = do
 
               execDb db "COMMIT"
 
-              -- Phase 4: parallel NLopt fit
-              -- Each worker gets its own connection (SQLite WAL serializes writers,
-              -- but busy_timeout lets them wait instead of failing immediately).
-              nCaps <- getNumCapabilities
-              let workerCount = max 1 (min nCaps (max 1 (length survivors)))
-              workers <- replicateM workerCount $ do
-                w <- open (T.pack fitdataDb)
-                exec w "PRAGMA busy_timeout = 30000"
-                pure w
-              let workerChunks = chunk workerCount survivors
+              -- Phase 4: parallel NLopt fit (single connection, GHC green threads
+              -- serialize the FFI calls naturally).
+              let chunks = chunk nCaps survivors
               setMTPopParallel True
-              void $ forConcurrently_ (zip workers workerChunks) $ \(w, jobs') ->
-                mapM_ (fitOne fitdataQuiet w dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter) jobs'
+              void $ mapConcurrently_ (mapM_ (fitOne fitdataQuiet db dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter)) chunks
               setMTPopParallel False
-              mapM_ close workers
 
-              -- Reclaim WAL space (main connection is idle, checkpoint should succeed)
-              bracket (open (T.pack fitdataDb)) close $ \ck -> do
-                exec ck "PRAGMA busy_timeout = 30000"
-                _ <- queryDb ck "PRAGMA wal_checkpoint(TRUNCATE)" []
-                pure ()
               unless fitdataQuiet $ putStrLn "  [checkpoint] committed batch"
 
         -- Stream IDs in batches using foldQueryDb to avoid retaining full list spine
@@ -398,6 +384,8 @@ withSQLite path f = bracket openDb close f
     openDb = do
       db <- open (T.pack path)
       exec db "PRAGMA journal_mode=WAL"
+      exec db "PRAGMA wal_autocheckpoint = 100"
+      exec db "PRAGMA busy_timeout = 30000"
       pure db
 
 -- | Run refit: clear all fitted data for a dataset, then re-fit everything.
