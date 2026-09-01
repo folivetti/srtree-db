@@ -10,7 +10,7 @@ module FitData
   , runRefit
   ) where
 
-import Control.Concurrent (getNumCapabilities)
+import Control.Concurrent (getNumCapabilities, threadDelay)
 import Control.Concurrent.Async (mapConcurrently_)
 import Control.Monad (replicateM, when, unless, void)
 import Control.Exception (bracket, SomeException, catch, SomeAsyncException(..))
@@ -172,8 +172,7 @@ runFitData opts = do
 
               execDb db "COMMIT"
 
-              -- Phase 4: parallel NLopt fit (single connection, GHC green threads
-              -- serialize the FFI calls naturally).
+              -- Phase 4: parallel NLopt fit
               let chunks = chunk nCaps survivors
               setMTPopParallel True
               void $ mapConcurrently_ (mapM_ (fitOne fitdataQuiet db dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter)) chunks
@@ -183,6 +182,10 @@ runFitData opts = do
 
         -- Stream IDs in batches using foldQueryDb to avoid retaining full list spine
         processStreamingBatches db dsid fitdataBatchSize processBatch
+
+        -- Final checkpoint: close and reopen to force WAL truncation
+        putStrLn "  Flushing WAL..."
+        hFlush stdout
 
         fitted <- readIORef counter
         putStrLn $ "Fitted " ++ show fitted ++ "/" ++ show total
@@ -383,8 +386,6 @@ withSQLite path f = bracket openDb close f
   where
     openDb = do
       db <- open (T.pack path)
-      exec db "PRAGMA journal_mode=WAL"
-      exec db "PRAGMA wal_autocheckpoint = 100"
       exec db "PRAGMA busy_timeout = 30000"
       pure db
 
