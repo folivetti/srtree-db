@@ -11,7 +11,7 @@ module FitData
   ) where
 
 import Control.Concurrent (getNumCapabilities, threadDelay)
-import Control.Concurrent.Async (mapConcurrently_, mapConcurrently, async, wait)
+import Control.Concurrent.Async (mapConcurrently_, mapConcurrently)
 import Control.Monad (replicateM, when, unless, void, forM_)
 import Control.Exception (bracket, SomeException, catch, SomeAsyncException(..))
 import Data.IORef
@@ -192,10 +192,12 @@ runFitData opts = do
                 execDb fitDb "COMMIT"
                 unless fitdataQuiet $ putStrLn "  [checkpoint] committed batch"
 
-          -- Collect all batches, then process with pipelining
-          allBatches <- collectBatches egDb fitDb dsid fitdataBatchSize
+          -- Stream IDs in batches, process sequentially (O(1) memory for IDs)
           pendingRef <- newIORef ([] :: [FitPending])
-          processBatchesPipelined egDb fitDb nCaps (loadPhase pendingRef) (fitPhase pendingRef) allBatches
+          let processBatch batch = do
+                survivors <- loadPhase pendingRef batch
+                fitPhase pendingRef survivors
+          processStreamingBatches egDb fitDb dsid fitdataBatchSize processBatch
 
           fitted <- readIORef counter
           putStrLn $ "Fitted " ++ show fitted ++ "/" ++ show total
@@ -438,76 +440,6 @@ processStreamingBatches egDb fitDb dsid batchSize processBatch = do
       _ -> pure ())
   remaining <- readIORef batchRef
   when (not (null remaining)) $ processBatch (reverse remaining)
-
--- | Collect all unfitted batch IDs into a list of batches.
-collectBatches :: (SqlBackend db1, SqlBackend db2)
-               => db1 -> db2 -> Int -> Int -> IO [[EClassId]]
-collectBatches egDb fitDb dsid batchSize = do
-  fittedSet <- loadFittedSet fitDb dsid
-  batchesRef <- newIORef ([] :: [[EClassId]])
-  batchRef <- newIORef ([] :: [EClassId])
-  countRef <- newIORef (0 :: Int)
-  foldQueryDb egDb
-    "SELECT eid FROM eclass ORDER BY eid"
-    []
-    ()
-    (\() cols -> case cols of
-      [eidCol] -> do
-        let !eid = sqlToInt eidCol
-        if IntSet.member eid fittedSet
-          then pure ()
-          else do
-            batch <- readIORef batchRef
-            let !batch' = eid : batch
-            n <- readIORef countRef
-            let !n' = n + 1
-            writeIORef countRef n'
-            if n' >= batchSize
-              then do
-                modifyIORef' batchesRef (reverse batch' :)
-                writeIORef batchRef []
-                writeIORef countRef 0
-              else writeIORef batchRef batch'
-        pure ()
-      _ -> pure ())
-  remaining <- readIORef batchRef
-  when (not (null remaining)) $ modifyIORef' batchesRef (reverse remaining :)
-  allBatches <- readIORef batchesRef
-  pure (reverse allBatches)
-
--- | Process batches with pipelining: while batch K's Phase 4 (NLopt) runs,
--- batch K+1's Phase 0-1 (loading) starts in the background.
--- Hides I/O latency behind compute.
-processBatchesPipelined :: (SqlBackend db1, SqlBackend db2)
-                        => db1 -> db2 -> Int
-                        -> ([EClassId] -> IO [FitJob])
-                        -> ([FitJob] -> IO ())
-                        -> [[EClassId]]
-                        -> IO ()
-processBatchesPipelined _ _ _ _ _ [] = pure ()
-processBatchesPipelined egDb fitDb nCaps loadPhase fitPhase [batch] = do
-  survivors <- loadPhase batch
-  fitPhase survivors
-processBatchesPipelined egDb fitDb nCaps loadPhase fitPhase (batch:rest) = do
-  -- Start loading next batch in background
-  nextLoad <- async $ loadPhase (head rest)
-  -- Load and fit current batch
-  survivors <- loadPhase batch
-  fitPhase survivors
-  -- Wait for next load, then continue
-  processBatchesPipelined' nextLoad rest
-  where
-    processBatchesPipelined' prevLoad [] = do
-      survivors <- wait prevLoad
-      fitPhase survivors
-    processBatchesPipelined' prevLoad [b] = do
-      survivors <- wait prevLoad
-      fitPhase survivors
-    processBatchesPipelined' prevLoad (b:bs) = do
-      nextLoad <- async $ loadPhase b
-      survivors <- wait prevLoad
-      fitPhase survivors
-      processBatchesPipelined' nextLoad bs
 
 chunk :: Int -> [a] -> [[a]]
 chunk _ [] = []
