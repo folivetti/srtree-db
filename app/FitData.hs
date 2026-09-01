@@ -11,7 +11,7 @@ module FitData
   ) where
 
 import Control.Concurrent (getNumCapabilities)
-import Control.Concurrent.Async (mapConcurrently_)
+import Control.Concurrent.Async (forConcurrently_)
 import Control.Monad (replicateM, when, unless, void)
 import Control.Exception (bracket, SomeException, catch, SomeAsyncException(..))
 import Data.IORef
@@ -173,18 +173,24 @@ runFitData opts = do
               execDb db "COMMIT"
 
               -- Phase 4: parallel NLopt fit
-              -- GHC green threads serialize SQLite IO naturally; within-expression
-              -- parallelism is disabled (setMTPopParallel True) to avoid oversubscription.
-              let chunks = chunk nCaps survivors
+              -- Each worker gets its own connection (SQLite WAL serializes writers,
+              -- but busy_timeout lets them wait instead of failing immediately).
+              nCaps <- getNumCapabilities
+              let workerCount = max 1 (min nCaps (max 1 (length survivors)))
+              workers <- replicateM workerCount $ do
+                w <- open (T.pack fitdataDb)
+                exec w "PRAGMA busy_timeout = 30000"
+                pure w
+              let workerChunks = chunk workerCount survivors
               setMTPopParallel True
-              void $ mapConcurrently_ (mapM_ (fitOne fitdataQuiet db dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter)) chunks
+              void $ forConcurrently_ (zip workers workerChunks) $ \(w, jobs') ->
+                mapM_ (fitOne fitdataQuiet w dsid xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter) jobs'
               setMTPopParallel False
+              mapM_ close workers
 
-              -- Reclaim WAL space using a dedicated connection (avoids locking
-              -- conflicts with the main connection or concurrent readers).
+              -- Reclaim WAL space (main connection is idle, checkpoint should succeed)
               bracket (open (T.pack fitdataDb)) close $ \ck -> do
-                exec ck "PRAGMA journal_mode=WAL"
-                exec ck "PRAGMA busy_timeout = 10000"
+                exec ck "PRAGMA busy_timeout = 30000"
                 _ <- queryDb ck "PRAGMA wal_checkpoint(TRUNCATE)" []
                 pure ()
               unless fitdataQuiet $ putStrLn "  [checkpoint] committed batch"
