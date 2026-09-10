@@ -21,12 +21,14 @@
 module Algorithm.EqSat.Storage.SQLite
   ( saveGraph
   , loadGraph
+  , loadGraphResident
   , loadGraphLazy
   , pushFit
   , refreshFitness
   , query
   , flushStore
   , loadPagesBulk
+  , emptyPagedGraph
   ) where
 
 import Control.Monad (forM, forM_, when, foldM)
@@ -344,6 +346,53 @@ loadGraph db = do
             Left err  -> pure (Left err)
             Right eg  -> pure (Right eg { _classStore = Just (classStoreHandle ps) })
 
+-- | Load a fully resident graph (no paged store). All classes are in the
+-- resident map, the pattern trie is built, and no I/O occurs during eqsat.
+-- Used for benchmarking in-memory vs paged performance.
+-- Note: if some eclasses are referenced by nodes but don't have pages
+-- (e.g. created during eqsat but not flushed), this will skip them.
+loadGraphResident :: SqlBackend db => db -> IO (Either String EGraph)
+loadGraphResident db = do
+  m <- readMeta db
+  case m of
+    Nothing -> pure (Left "srtree-db: no e-graph stored in this database")
+    Just (nextId, trackDBs) -> do
+      enodes <- readNodes db
+      ecLst  <- readClasses db
+      mdsid <- firstDatasetId db
+      fit    <- case mdsid of
+                  Nothing -> pure []
+                  Just ds -> do
+                    rows <- readDatasetFit db ds
+                    pure [ (eid, (f, d, sz, parseTheta (T.unpack th)))
+                         | (eid, (f, d, sz, th)) <- rows ]
+      let canon     = IntMap.fromList [ (eid, c) | (eid, c, _) <- ecLst ]
+          nodeToEClass = HashMap.fromList enodes
+      ps <- openClassStore db defaultClassCap 1000
+      pages <- allPages ps
+      if null pages
+        then do
+          let classes = buildClasses canon nodeToEClass IntMap.empty (IntMap.fromList fit) (IntMap.fromList [ (eid, h) | (eid, _, h) <- ecLst ])
+              rows    = GraphRows canon nodeToEClass classes nextId trackDBs
+          pure (importEGraph rows)
+        else do
+          let fitMap = IntMap.fromList fit
+              applyFit eid ec =
+                case IntMap.lookup eid fitMap of
+                  Nothing -> ec
+                  Just (f, d, s, th) ->
+                    ec { _info = (_info ec){ _fitness = f, _dl = d, _size = s, _theta = th } }
+              classes  = IntMap.mapWithKey applyFit
+                           (IntMap.fromList [ (eid, decode (BL.fromStrict page)) | (eid, page) <- pages ])
+              -- Filter nodeToEClass to only reference eclasses that have pages
+              validEids = IntMap.keysSet classes
+              nodeToEClass' = HashMap.filter (`IntSet.member` validEids) nodeToEClass
+              toRow eid ec = EClassRow (_eNodes ec) (_parents ec) (_height ec) (_info ec)
+              rows = GraphRows canon nodeToEClass' (IntMap.mapWithKey toRow classes) nextId trackDBs
+          -- Note: _classStore = Nothing, so the Identity/State instance is used
+          -- (no I/O during eqsat, pure IntMap/HashMap lookups)
+          pure (importEGraph rows)
+
 -- | Write back any pending dirty e-class pages when the graph carries a
 -- paged store (a no-op on a fully resident graph). Call this at durable
 -- commit points (e.g. rewrite-loop iteration boundaries).
@@ -404,9 +453,13 @@ seedEDB nextId trackDBs nodeToEClass fitMap =
 seedEDBPaged
   :: Int -> Bool
   -> HashMap.HashMap ENode EClassId
+  -> Int    -- ^ resident class cache capacity
+  -> Int    -- ^ node-to-class cache capacity
+  -> Int    -- ^ canonical map cache capacity
   -> EGraphDB
-seedEDBPaged nextId trackDBs _nodeToEClass =
-  (emptyDB){ _nextId = nextId, _trackDBs = trackDBs }
+seedEDBPaged nextId trackDBs _nodeToEClass residentCap nodeCap canonicalCap =
+  (emptyDB){ _nextId = nextId, _trackDBs = trackDBs
+           , _residentCap = residentCap, _nodeCap = nodeCap, _canonicalCap = canonicalCap }
 
 -- | Reconstruct an e-graph for out-of-core use: like 'loadGraph' but the
 -- resident e-class map is left empty and an 'EClassPageStore' handle is
@@ -422,8 +475,9 @@ seedEDBPaged nextId trackDBs _nodeToEClass =
 -- (bounded caches): canonical/node lookups fall back to the live relational
 -- tables ('cpsCanonicalOf'/'cpsNodeToClass'), which the write-through keeps
 -- current, so nothing O(nodes) is materialized at load.
-loadGraphLazy :: SqlBackend db => db -> Int -> IO (Either String EGraph)
-loadGraphLazy db dsid = do
+loadGraphLazy :: SqlBackend db => db -> Int -> Int -> Int -> Int -> IO (Either String EGraph)
+--                              db   dsid  residentCap nodeCap canonicalCap
+loadGraphLazy db dsid residentCap nodeCap canonicalCap = do
   m <- readMeta db
   case m of
     Nothing -> pure (Left "srtree-db: no e-graph stored in this database")
@@ -458,9 +512,19 @@ loadGraphLazy db dsid = do
           let base = classStoreHandle ps
               h    = base { cpsLookup = \eid ->
                               fmap (fmap (applyDsFit fitSlim eid)) (cpsLookup base eid) }
-              eDB  = seedEDBPaged nextId trackDBs HashMap.empty
+              eDB  = seedEDBPaged nextId trackDBs HashMap.empty residentCap nodeCap canonicalCap
               eg   = EGraph IntMap.empty HashMap.empty IntMap.empty eDB (Just h)
           pure (Right eg)
+
+-- | An empty out-of-core paged graph (no classes yet) with the given cache
+-- capacities. Used to seed a fresh database on the first 'DBInsert', so
+-- inserting into an empty DB works instead of failing with "no e-graph stored".
+emptyPagedGraph :: SqlBackend db => db -> Int -> Int -> Int -> IO EGraph
+emptyPagedGraph db residentCap nodeCap canonicalCap = do
+  ps <- openClassStore db defaultClassCap 1000
+  let eDB = seedEDBPaged 0 True HashMap.empty residentCap nodeCap canonicalCap
+      eg  = EGraph IntMap.empty HashMap.empty IntMap.empty eDB (Just (classStoreHandle ps))
+  pure eg
 
 -- | Apply a dataset's fitness metadata to a class read from the structural page
 -- store (fitness/dl/size are dataset-specific, so they are attached on read
