@@ -208,6 +208,12 @@ writeNode db eid en key children h fit mdsid = do
       [ SqlText (T.pack key)
       , SqlInteger (fromIntegral c)
       , SqlInteger (fromIntegral n) ]
+  -- enode_parent rows for ALL node types (reverse index for parent walks)
+  forM_ children $ \(c, _, _) ->
+    runDb db "INSERT OR IGNORE INTO enode_parent (child_eid, enode_key, parent_eid) VALUES (?, ?, ?)"
+      [ SqlInteger (fromIntegral c)
+      , SqlText (T.pack key)
+      , SqlInteger (fromIntegral eid) ]
   -- Write the class page inline (O(1) per new class, no post-pass needed)
   let parents = HashSet.fromList
         [ (c, fromMaybe (error "importEqs: bad parent key in page write") (parseEnodeKey key))
@@ -256,11 +262,15 @@ lookupClassNode db eid = do
 -- dataset's graph, so "was this expression already tested?" is answerable per
 -- dataset. Used by the delta-insert path ('dbInsert') to keep @expression_index@
 -- live for newly-added expressions.
-recordExpressionIndex :: SqlBackend db => db -> Int -> EClassId -> IO ()
-recordExpressionIndex db dsid eid = do
-  mroot <- lookupClassNode db eid
+-- | Record that an expression (by its canonical root e-node) was seen in a
+-- dataset's graph. The node lookup hits the egraph tables (@eclass_node@, which
+-- lives in the egraph DB), while the @expression_index@ row is written to the
+-- dataset/fit DB. In the single-DB case both handles point at the same file.
+recordExpressionIndex :: (SqlBackend eg, SqlBackend fit) => eg -> fit -> Int -> EClassId -> IO ()
+recordExpressionIndex egDb fitDb dsid eid = do
+  mroot <- lookupClassNode egDb eid
   forM_ mroot $ \en ->
-    runDb db
+    runDb fitDb
       "INSERT OR REPLACE INTO expression_index (expression_key, eclass, dataset_id) VALUES (?, ?, ?)"
       [ SqlText (T.pack (enodeKey en))
       , SqlInteger (fromIntegral eid)

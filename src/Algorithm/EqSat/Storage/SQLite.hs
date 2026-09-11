@@ -29,6 +29,7 @@ module Algorithm.EqSat.Storage.SQLite
   , flushStore
   , loadPagesBulk
   , emptyPagedGraph
+  , createSchema
   ) where
 
 import Control.Monad (forM, forM_, when, foldM)
