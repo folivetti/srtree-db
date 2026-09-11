@@ -478,7 +478,10 @@ seedEDBPaged nextId trackDBs _nodeToEClass residentCap nodeCap canonicalCap =
 loadGraphLazy :: SqlBackend db => db -> Int -> Int -> Int -> Int -> IO (Either String EGraph)
 --                              db   dsid  residentCap nodeCap canonicalCap
 loadGraphLazy db dsid residentCap nodeCap canonicalCap = do
-  m <- readMeta db
+  m <- readMeta db `catch` \(_ :: SomeException) -> do
+         -- The egraph tables may not exist yet on a fresh database (e.g. first
+         -- insert); treat that as "no e-graph stored" rather than crashing.
+         pure Nothing
   case m of
     Nothing -> pure (Left "srtree-db: no e-graph stored in this database")
     Just (nextId, trackDBs) -> do
