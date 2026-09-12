@@ -10,7 +10,7 @@
 #   6. Export valid expressions as CSV
 #
 # Prerequisites:
-#   cabal build srtree-db
+#   cabal install srtree-db
 #   python3 (for gen_expressions.py)
 #
 # Run from the tutorials/ directory:
@@ -18,15 +18,15 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRTOOLS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-SRTREE_DB_DIR="$SRTOOLS_DIR/srtree-db"
+SCRIPT_DIR="tutorials" # $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRTOOLS_DIR="" #"$(cd "$SCRIPT_DIR/.." && pwd)"
+SRTREE_DB_DIR="" #"$SRTOOLS_DIR/srtree-db"
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
 
 # Helper: run srtree-db command from the correct directory
 db_tool() {
-  (cd "$SRTREE_DB_DIR" && cabal -v0 run srtree-db -- "$@")
+  (srtree-db "$@")
 }
 
 echo "=== srtree-db export workflow demo ==="
@@ -76,7 +76,7 @@ echo
 # 4. Convert to split-DB format
 # ---------------------------------------------------------------------------
 echo "--- Step 4: Convert to split-DB format ---"
-python3 "$SRTOOLS_DIR/srtree-db/tools/convert_db.py" \
+python3 "tools/convert_db.py" \
   --input "$WORKDIR/combined.db" \
   --egraph "$WORKDIR/egraph.db" \
   --fit-prefix "$WORKDIR/fit_"
