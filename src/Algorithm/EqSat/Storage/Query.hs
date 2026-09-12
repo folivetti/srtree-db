@@ -14,6 +14,7 @@ module Algorithm.EqSat.Storage.Query
   , writeDatasetFit
   , readDatasetFit
   , topN
+  , topNIn
   , pareto
   , paretoBySize
   , distributionCounts
@@ -21,6 +22,8 @@ module Algorithm.EqSat.Storage.Query
   , expressionEclass
   , testedOnDataset
   , versionsOf
+  , parentsOf
+  , ancestorsOf
   ) where
 
 import Data.Maybe (catMaybes)
@@ -194,3 +197,42 @@ countPattern db op = do
   pure $ case rows of
     row : _ | [n] <- row -> sqlToInt n
     _                    -> 0
+
+-- | Direct parents of an eclass via the @enode_parent@ reverse index.
+parentsOf :: SqlBackend db => db -> EClassId -> IO [EClassId]
+parentsOf db childEid = do
+  rows <- queryDb db
+    "SELECT DISTINCT parent_eid FROM enode_parent WHERE child_eid = ?"
+    [SqlInteger (fromIntegral childEid)]
+  pure [ sqlToInt eid | [eid] <- rows ]
+
+-- | All ancestors of the given eclasses, using a SQL recursive CTE.
+-- Bounded by @maxDepth@ levels of parent traversal.
+ancestorsOf :: SqlBackend db => db -> Int -> [EClassId] -> IO [EClassId]
+ancestorsOf _ _ [] = pure []
+ancestorsOf db maxDepth seeds = do
+  let seedClause = T.intercalate "," (map (T.pack . show) seeds)
+      cte = "WITH RECURSIVE ancestors(eid, depth) AS (\
+            \ SELECT eid, 0 FROM eclass WHERE eid IN (" <> seedClause <> ")\
+            \ UNION\
+            \ SELECT ep.parent_eid, a.depth + 1\
+            \ FROM enode_parent ep\
+            \ JOIN ancestors a ON ep.child_eid = a.eid\
+            \ WHERE a.depth < " <> T.pack (show maxDepth) <> "\
+            \) SELECT DISTINCT eid FROM ancestors"
+  rows <- queryDb db cte []
+  pure [ sqlToInt eid | [eid] <- rows ]
+
+-- | Top @n@ e-classes by fitness from a set of candidate IDs.
+topNIn :: SqlBackend db => db -> Int -> Int -> [EClassId] -> IO [(EClassId, Double)]
+topNIn _ _ _ [] = pure []
+topNIn db ds n eids = do
+  let inClause = T.intercalate "," (map (T.pack . show) eids)
+      sql = "SELECT eid, fitness FROM dataset_fit\
+            \ WHERE dataset_id = ? AND fitness IS NOT NULL\
+            \ AND eid IN (" <> inClause <> ")\
+            \ ORDER BY fitness DESC LIMIT ?"
+  rows <- queryDb db sql [SqlInteger (fromIntegral ds), SqlInteger (fromIntegral n)]
+  pure [ (sqlToInt eid, f)
+       | [eid, f] <- rows
+       , Just f   <- [sqlToMaybeDouble f] ]

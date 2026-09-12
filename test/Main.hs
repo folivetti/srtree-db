@@ -36,7 +36,7 @@ import Algorithm.EqSat.Storage.Backend ( SqlValue(..), SqlBackend(..), sqlToInt 
 import Algorithm.EqSat.Storage.ClassStore
 import Algorithm.EqSat.Storage.SQLite
 import Algorithm.EqSat.Storage.Query (getOrCreateDataset)
-import Algorithm.EqSat.Storage.Backend (SqlBackend)
+import Algorithm.EqSat.Storage.Backend (SqlBackend, queryDb, execDb, runDb)
 import Algorithm.EqSat.Storage.Postgres ()
 import qualified Algorithm.EqSat.Storage.Query as Q
 
@@ -302,7 +302,7 @@ testLazyLoad openDb closeDb = TestCase $ do
   db <- openDb
   (eg, eidAdd, eidP2, _) <- buildGraph
   _ <- saveGraphTest db eg
-  obj <- loadGraphLazy db 1
+  obj <- loadGraphLazy db 1 50000 100000 100000
   case obj of
     Left err -> assertFailure ("loadGraphLazy failed: " <> err)
     Right eg' -> do
@@ -350,7 +350,7 @@ testLazyRewrite openDb closeDb = TestCase $ do
         _ <- fromTree myCost (var 0 / var 0)
         pure ()
   _ <- saveGraphTest db eg
-  obj <- loadGraphLazy db 1
+  obj <- loadGraphLazy db 1 50000 100000 100000
   case obj of
     Left err -> assertFailure ("loadGraphLazy failed: " <> err)
     Right eg' -> do
@@ -389,7 +389,7 @@ testPagedEqSatReload openDb closeDb = TestCase $ do
         insertFitness eidAdd 0.9 []
         pure (eidP, eidXx, eidAdd)
   _ <- saveGraphTest db eg
-  obj <- loadGraphLazy db 1
+  obj <- loadGraphLazy db 1 50000 100000 100000
   case obj of
     Left err -> assertFailure ("loadGraphLazy failed: " <> err)
     Right eg0 -> do
@@ -409,7 +409,7 @@ testPagedEqSatReload openDb closeDb = TestCase $ do
         (case ecRows of [[v]] -> sqlToInt v > 0; _ -> False)
       _ <- saveGraphTest db g1
       -- reload a fresh lazy graph
-      obj2 <- loadGraphLazy db 1
+      obj2 <- loadGraphLazy db 1 50000 100000 100000
       case obj2 of
         Left err2 -> assertFailure ("reload failed: " <> err2)
         Right eg2 -> do
@@ -437,7 +437,7 @@ testPagedPushFit openDb closeDb = TestCase $ do
   db <- openDb
   (eg, eidAdd, _, _) <- buildGraph
   _ <- saveGraphTest db eg
-  obj <- loadGraphLazy db 1
+  obj <- loadGraphLazy db 1 50000 100000 100000
   case obj of
     Left err -> assertFailure ("loadGraphLazy failed: " <> err)
     Right eg0 -> do
@@ -464,7 +464,7 @@ testFrontierReload openDb closeDb = TestCase $ do
         eidD <- fromTree myCost (var 1 ** 2)      -- x1**2
         pure (eidA, eidB, eidC, eidD)
   _ <- saveGraphTest db eg
-  obj <- loadGraphLazy db 1
+  obj <- loadGraphLazy db 1 50000 100000 100000
   case obj of
     Left err -> assertFailure ("loadGraphLazy failed: " <> err)
     Right eg0 -> case _classStore eg0 of
@@ -515,7 +515,7 @@ testEquivInMemDB openDb closeDb = TestCase $ do
   assertBool   "in-mem: pairs distinct" (mA /= mC)
   -- --- DB/paged path ---
   _ <- saveGraphTest db eg
-  obj <- loadGraphLazy db 1
+  obj <- loadGraphLazy db 1 50000 100000 100000
   case obj of
     Left err -> assertFailure ("loadGraphLazy failed: " <> err)
     Right eg0 -> do
@@ -542,11 +542,56 @@ runPagedSuite tag (openDb, closeDb) =
   , TestLabel (tag <> " equiv-inmem-db")    (testEquivInMemDB openDb closeDb)
   ]
 
+-- | Test enode_parent reverse index: parentsOf and ancestorsOf
+testEnodeParent :: SqlBackend db => (IO db, db -> IO ()) -> Test
+testEnodeParent (openDb, closeDb) = TestLabel "enode-parent" $ TestCase $ do
+  -- Build graph: x0 + x1 (eidAdd), x0 * (x0 + x1) (eidMul)
+  let ((eidAdd, eidMul), eg0) = runIn emptyGraph $ do
+        _ <- fromTree myCost (var 0)
+        _ <- fromTree myCost (var 1)
+        eidAdd <- fromTree myCost (var 0 + var 1)
+        eidMul <- fromTree myCost ((var 0 + var 1) * var 2)
+        pure (eidAdd, eidMul)
+  -- Save to DB
+  db <- openDb
+  saveGraphTest db eg0
+  -- Manually populate enode_parent (saveGraph doesn't do this; importEqs and flushNodes do)
+  -- Query actual enode keys from the DB
+  addKey <- queryDb db "SELECT enode_key FROM eclass_node WHERE eid = ?" [SqlInteger (fromIntegral eidAdd)]
+  let addKeyStr = case addKey of [[SqlText k]] -> T.unpack k; _ -> "Bin Add 0 1"
+  mulKey <- queryDb db "SELECT enode_key FROM eclass_node WHERE eid = ?" [SqlInteger (fromIntegral eidMul)]
+  let mulKeyStr = case mulKey of [[SqlText k]] -> T.unpack k; _ -> "Bin Mul 0 2"
+  -- Insert parent rows for Add's children (x0=0, x1=1)
+  runDb db "INSERT OR IGNORE INTO enode_parent (child_eid, enode_key, parent_eid) VALUES (0, ?, ?)"
+    [SqlText (T.pack addKeyStr), SqlInteger (fromIntegral eidAdd)]
+  runDb db "INSERT OR IGNORE INTO enode_parent (child_eid, enode_key, parent_eid) VALUES (1, ?, ?)"
+    [SqlText (T.pack addKeyStr), SqlInteger (fromIntegral eidAdd)]
+  -- Insert parent rows for Mul's children (Add class, x2=2)
+  runDb db "INSERT OR IGNORE INTO enode_parent (child_eid, enode_key, parent_eid) VALUES (?, ?, ?)"
+    [SqlInteger (fromIntegral eidAdd), SqlText (T.pack mulKeyStr), SqlInteger (fromIntegral eidMul)]
+  runDb db "INSERT OR IGNORE INTO enode_parent (child_eid, enode_key, parent_eid) VALUES (2, ?, ?)"
+    [SqlText (T.pack mulKeyStr), SqlInteger (fromIntegral eidMul)]
+  -- Verify enode_parent rows exist
+  rows <- queryDb db "SELECT COUNT(*) FROM enode_parent" []
+  let count = case rows of [[n]] -> sqlToInt n; _ -> 0
+  assertBool ("enode_parent should have rows, got " ++ show count) (count > 0)
+  -- Test parentsOf: x0's parent should be the Add class
+  parents <- Q.parentsOf db 0  -- x0 is eid 0
+  assertBool "x0 should have parents" (not (null parents))
+  assertBool "x0's parent should include the Add class" (eidAdd `elem` parents)
+  -- Test ancestorsOf: ancestors of x0 should include Add and Mul
+  ancestors <- Q.ancestorsOf db 10 [0]
+  assertBool "x0 should have ancestors" (not (null ancestors))
+  assertBool "ancestors should include Add" (eidAdd `elem` ancestors)
+  assertBool "ancestors should include Mul" (eidMul `elem` ancestors)
+  closeDb db
+
 runSuite :: SqlBackend db => String -> (IO db, db -> IO ()) -> [Test]
 runSuite tag (openDb, closeDb) =
   [ TestLabel (tag <> " save-load-roundtrip") (testSaveLoadRT openDb closeDb)
   , TestLabel (tag <> " queries")             (testQueries openDb closeDb)
   , TestLabel (tag <> " sync")                (testSync openDb closeDb)
+  , TestLabel (tag <> " enode-parent")        (testEnodeParent (openDb, closeDb))
   ]
     <> runStoreSuite tag (openDb, closeDb)
 

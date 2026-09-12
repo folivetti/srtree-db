@@ -67,7 +67,7 @@ import Algorithm.EqSat.Storage.Backend
 import Algorithm.EqSat.Storage.Types
   ( enodeKey, enodeOpTag, enodeOpDetail, opDetailOf )
 import Algorithm.EqSat.Egraph
-  ( EClass, EClassPageStore(..), ENode(..), _eClassId )
+  ( EClass, EClassId, EClassPageStore(..), ENode(..), _eClassId )
 
 -- ---------------------------------------------------------------------------
 -- LRU page cache
@@ -249,6 +249,10 @@ flushNodes ps = do
       forM_ (naryChildren en) $ \(c, n) ->
         insertIgnore db "enode_child (enode_key, child_eid, cnt) VALUES (?, ?, ?)"
           [ SqlText key, SqlInteger (fromIntegral c), SqlInteger (fromIntegral n) ]
+      -- enode_parent rows for ALL node types (reverse index for parent walks)
+      forM_ (allChildren en) $ \c ->
+        insertIgnore db "enode_parent (child_eid, enode_key, parent_eid) VALUES (?, ?, ?)"
+          [ SqlInteger (fromIntegral c), SqlText key, SqlInteger (fromIntegral eid) ]
     execDb db "COMMIT"
     modifyIORef' (psNodes ps) (const Set.empty)
 
@@ -256,6 +260,13 @@ flushNodes ps = do
 naryChildren :: ENode -> [(Int, Int)]
 naryChildren (ENAry _ m) = IM.toList m
 naryChildren _           = []
+
+-- | All children of any node type (for enode_parent population).
+allChildren :: ENode -> [Int]
+allChildren (EUni _ c)   = [c]
+allChildren (EBin _ l r) = [l, r]
+allChildren (ENAry _ m)  = IM.keys m
+allChildren _            = []
 
 -- | Flush any pending canonical rows (recorded via 'cpsRecordCanonical') into
 -- @eclass.canonical@ (idempotent upsert), so the streaming canonical lookup
@@ -367,12 +378,35 @@ flushFrontier ps = do
 openClassStore :: SqlBackend db => db -> Int -> Int -> IO (PageStore db)
 openClassStore db cap flushEvery' = newPageStore db classStoreTable cap flushEvery'
 
+-- | Bulk-load pages for multiple eclasses in one SQL query.
+-- Splits into chunks of 500 to respect SQLite parameter limits.
+bulkLoadPages :: SqlBackend db => PageStore db -> [EClassId] -> IO (IM.IntMap EClass)
+bulkLoadPages _ [] = pure IM.empty
+bulkLoadPages ps eids = do
+  let chunks = chunkList 500 eids
+  IM.unions <$> mapM loadChunk chunks
+  where
+    chunkList _ [] = []
+    chunkList n xs = let (h, t) = Prelude.splitAt n xs in h : chunkList n t
+
+    loadChunk ids = do
+      let placeholders = T.intercalate "," (map (const "?") ids)
+          params = map (SqlInteger . fromIntegral) ids
+      rows <- queryDb (psDb ps)
+        ("SELECT key, blob FROM " <> classStoreTable <> " WHERE key IN (" <> placeholders <> ")")
+        params
+      pure $ IM.fromList
+        [ (sqlToInt k, decode (BL.fromStrict (sqlToBlob b)))
+        | [k, b] <- rows
+        ]
+
 -- | Adapt a 'PageStore' into the 'EClassPageStore' handle an 'EGraph' carries:
 -- e-class blobs are 'Binary'-serialized pages. The store is authoritative;
 -- the graph's resident map mirrors insertions and is consulted first on reads.
 classStoreHandle :: SqlBackend db => PageStore db -> EClassPageStore
 classStoreHandle ps = EClassPageStore
   { cpsLookup = \eid -> fmap (fmap (decode . BL.fromStrict)) (readPage ps eid)
+  , cpsBulkLookup = bulkLoadPages ps
   , cpsInsert = \ec -> writePage ps (_eClassId ec) (BL.toStrict (encode ec))
   , cpsDelete = \eid -> deletePage ps eid
   , cpsFlush  = writeback ps >> flushFrontier ps >> pure ()

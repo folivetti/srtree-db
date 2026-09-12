@@ -144,17 +144,28 @@ runFitData opts = do
                 let batchIds = IntSet.fromList batch
                 batchPages <- loadPagesBulk egDb (IntSet.toList batchIds)
                 let !cache0 = batchPages
-                let expandLoop !cache = do
-                      let needed = foldl' (\s eid -> s `IntSet.union` expandTreeIds cache eid) IntSet.empty batch
-                          missing = IntSet.toList (IntSet.difference needed (IntSet.fromList (IntMap.keys cache)))
+                -- BFS: only walk newly-loaded pages to discover their children,
+                -- instead of re-walking all cached pages every iteration.
+                -- Track "unavailable" IDs (non-canonical eclasses with no page)
+                -- to avoid infinite loops.
+                let expandLoop !cache !toExplore !unavailable = do
+                      let newNeeded = IntSet.unions
+                            [ expandTreeIds cache eid | eid <- IntSet.toList toExplore ]
+                          missing = IntSet.toList
+                            (IntSet.difference (IntSet.difference newNeeded (IntSet.fromList (IntMap.keys cache))) unavailable)
                       if null missing
-                        then pure (cache, needed)
+                        then pure cache
                         else do
-                          putStrLn $ "  Loading " ++ show (length missing) ++ " sub-expression pages..."
-                          hFlush stdout
                           newPages <- loadPagesBulk egDb missing
+                          let loaded = IntMap.keysSet newPages
+                              failed = IntSet.fromList [ eid | eid <- missing, IntSet.notMember eid loaded ]
                           expandLoop (cache `IntMap.union` newPages)
-                (cache1, needed) <- expandLoop cache0
+                                     (IntSet.fromList missing `IntSet.difference` failed)
+                                     (unavailable `IntSet.union` failed)
+                cache1 <- expandLoop cache0 batchIds IntSet.empty
+
+                -- Collect all reachable IDs (for job building)
+                let needed = foldl' (\s eid -> s `IntSet.union` expandTreeIds cache1 eid) IntSet.empty batch
 
                 -- Phase 2: build jobs (reconstruct, handle cache misses)
                 let toFit = IntSet.toList needed
@@ -416,7 +427,7 @@ processStreamingBatches egDb fitDb dsid batchSize processBatch = do
   batchRef <- newIORef ([] :: [EClassId])
   countRef <- newIORef (0 :: Int)
   foldQueryDb egDb
-    "SELECT eid FROM eclass ORDER BY eid"
+    "SELECT eid FROM eclass WHERE canonical = eid ORDER BY eid"
     []
     ()
     (\() cols -> case cols of

@@ -19,6 +19,7 @@ import qualified Data.IntMap as IntMap
 import qualified Data.HashSet as Set
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
+import Control.Monad (foldM)
 
 import Data.SRTree (Fix(..), SRTree(..), Op(..), Function(..))
 import Algorithm.EqSat.Egraph (EClassId, EClass(..), EClassData(..), ENode(..), NOp(..), toOp)
@@ -312,3 +313,5 @@ expandTreeIds cache root = go IntSet.empty 0 root
       in go seen' (n + 1) r
     expandNode seen n (ENAry _ m) =
       foldl' (\s (cid, _) -> go s (n + 1) cid) seen (IntMap.toAscList m)
+
+
