@@ -1,5 +1,9 @@
 # Changelog for srtree-db
 
+## 0.1.3.1
+
+- **Fix**: spawning multiple threads even when using `-N` flag to limit it. 
+
 ## 0.1.3.0
 
 - **New CLI subcommands**:

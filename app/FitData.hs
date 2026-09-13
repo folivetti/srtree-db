@@ -10,7 +10,7 @@ module FitData
   , runRefit
   ) where
 
-import Control.Concurrent (getNumCapabilities, threadDelay)
+import Control.Concurrent (getNumCapabilities, setNumCapabilities, threadDelay)
 import Control.Concurrent.Async (mapConcurrently_, mapConcurrently)
 import Control.Monad (replicateM, when, unless, void, forM_)
 import Control.Exception (bracket, SomeException, catch, SomeAsyncException(..))
@@ -56,6 +56,7 @@ data FitDataOpts = FitDataOpts
   , fitdataNIter       :: Int
   , fitdataBatchSize   :: Int
   , fitdataQuiet       :: Bool
+  , fitdataJobs        :: Int
   } deriving (Show)
 
 fitdataParser :: Parser FitDataOpts
@@ -103,11 +104,18 @@ fitdataParser = FitDataOpts
       ( long "quiet"
       <> short 'q'
       <> help "Suppress per-expression output; print progress every 10k expressions" )
+  <*> option auto
+      ( long "jobs"
+      <> short 'j'
+      <> value 0
+      <> metavar "N"
+      <> help "Number of parallel workers (0 = single-threaded, default)" )
 
 -- | Run the fitdata sub-command.
 runFitData :: FitDataOpts -> IO ()
 runFitData opts = do
   let FitDataOpts{..} = opts
+  when (fitdataJobs > 0) $ setNumCapabilities fitdataJobs
   putStrLn $ "Loading dataset: " ++ fitdataData
   hFlush stdout
   ((xTrain, yTrain, _xVal, _yVal), (mYErr, _), _varnames, _target) <-
@@ -188,9 +196,9 @@ runFitData opts = do
           -- Phase 4-5: parallel NLopt + batch write (uses fitDb)
           let fitPhase pendingRef survivors = do
                 let chunks = chunk nCaps survivors
-                setMTPopParallel False
-                results <- fmap concat $ mapConcurrently (mapM (fitOneNLopt fitdataQuiet xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter)) chunks
                 setMTPopParallel True
+                results <- fmap concat $ mapConcurrently (mapM (fitOneNLopt fitdataQuiet xTrain yTrain mYErr fitdataLoss fitdataNIter fitdataNRep counter)) chunks
+                setMTPopParallel False
                 -- Batch write all pending fits (invalid + analytical + NLopt)
                 pending <- atomicModifyIORef' pendingRef (\ps -> ([], ps))
                 execDb fitDb "BEGIN"
@@ -482,6 +490,7 @@ withSQLite path f = bracket openDb close f
 runRefit :: FitDataOpts -> IO ()
 runRefit opts = do
   let FitDataOpts{..} = opts
+  when (fitdataJobs > 0) $ setNumCapabilities fitdataJobs
   putStrLn $ "Refitting dataset: " ++ fitdataDataset
   putStrLn $ "Clearing previous fit data..."
   hFlush stdout
