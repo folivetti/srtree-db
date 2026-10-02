@@ -1,5 +1,18 @@
 # Changelog for srtree-db
 
+## 0.1.3.2
+
+- **fitdata: NLopt restart-scale escalation** (`fitOneNLopt`): parameterized
+  expressions whose valid region is far from 0 (e.g. `Log(x0+t0)` needs
+  `t0 > -min(x0)`) were wrongly flagged invalid because every `[-1,1]` random
+  restart landed in the NaN region. Restarts now escalate through scales
+  `[1, 10, 100, 1000]` until a finite fit is found (only escalating if all
+  restarts at the current scale are NaN/Inf, so normal fits are unchanged).
+  Genuinely unfittable expressions (e.g. `Log(x1*t0)` when `x1` spans both
+  signs) still fail at every scale and remain flagged.
+- **Query helper**: added `topNFiltered` for `topN` with SQL-level filters on
+  `size` and computed `n_params` (cost filters handled by the caller).
+
 ## 0.1.3.1
 
 - **Fix**: spawning multiple threads even when using `-N` flag to limit it. 

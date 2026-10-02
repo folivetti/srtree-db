@@ -15,6 +15,7 @@ module Algorithm.EqSat.Storage.Query
   , readDatasetFit
   , topN
   , topNIn
+  , topNFiltered
   , pareto
   , paretoBySize
   , distributionCounts
@@ -117,6 +118,41 @@ topN db ds n = do
   pure [ (sqlToInt eid, f)
        | [eid, f] <- rows
        , Just f   <- [sqlToMaybeDouble f] ]
+
+-- | Like 'topN' but with SQL-level filters on @size@ and computed @n_params@.
+-- Each filter is a triple @(field, op, value)@ where field is @\"size\"@ or
+-- @\"parameters\"@, op is one of @\"<\"@, @\"<=\"@, @\"=\"@, @\">=\"@, @\">\"@,
+-- and value is the integer threshold.
+-- Filters on @\"cost\"@ are ignored here (handled post-query by the caller).
+topNFiltered :: SqlBackend db => db -> Int -> Int -> [(String, String, Int)] -> IO [(EClassId, Double)]
+topNFiltered db ds n filters = do
+  let sqlFilters = [ (field, op, v) | (field, op, v) <- filters, field /= "cost" ]
+      (extraClauses, extraParams) = unzip $ map mkFilterClause sqlFilters
+      baseQ = "SELECT eid, fitness FROM dataset_fit \
+              \WHERE dataset_id = ? AND fitness IS NOT NULL"
+              <> T.concat extraClauses
+              <> " ORDER BY fitness DESC LIMIT ?"
+      params = [SqlInteger (fromIntegral ds)] ++ extraParams ++ [SqlInteger (fromIntegral n)]
+  rows <- queryDb db baseQ params
+  pure [ (sqlToInt eid, f)
+       | [eid, f] <- rows
+       , Just f   <- [sqlToMaybeDouble f] ]
+
+-- | Build a SQL clause fragment for a single filter.
+mkFilterClause :: (String, String, Int) -> (Text, SqlValue)
+mkFilterClause (field, op, v) =
+  let col = case field of
+              "size"       -> "size"
+              "parameters" -> "(CASE WHEN theta = '' THEN 0 ELSE LENGTH(theta) - LENGTH(REPLACE(theta, ',', '')) + 1 END)"
+              _            -> "size"  -- fallback
+      sqlOp = case op of
+                "<"  -> " < "
+                "<=" -> " <= "
+                "="  -> " = "
+                ">=" -> " >= "
+                ">"  -> " > "
+                _    -> " = "
+  in (" AND " <> T.pack col <> sqlOp <> "?", SqlInteger (fromIntegral v))
 
 -- | Non-dominated classes over (max fitness, min dl) on the dataset. Returns
 -- the (eid, fitness, dl) triples that are not dominated by any other class.

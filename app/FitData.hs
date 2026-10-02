@@ -351,21 +351,34 @@ fitOne quiet db dsid xTrain yTrain mYErr loss nIter nRep counter job = do
   writeDatasetFit db dsid (frEid fr) (Just (frFitness fr)) Nothing (frTheta fr) (frSize fr)
 
 -- | Pure NLopt fit (no DB side effects). Returns a FitResult.
+-- Restarts start at several increasing scales so a valid region far from 0
+-- (e.g. ``Log(x0+t0)`` needs ``t0 > -min(x0)``) is reachable, instead of every
+-- ``[-1,1]`` restart landing in the NaN region and the expression being wrongly
+-- flagged invalid. Only escalates if all restarts at the current scale are
+-- NaN/Inf, so normal fits are unchanged.
 fitOneNLopt :: Bool
             -> [VU.Vector Double] -> VU.Vector Double -> Maybe (VU.Vector Double)
             -> Loss -> Int -> Int -> IORef Int -> FitJob -> IO FitResult
 fitOneNLopt quiet xTrain yTrain mYErr loss nIter nRep counter (FitJob eid tree' _ np sz) = do
   let funAndGrad = compileLossAndGrad MultiThread loss mYErr xTrain yTrain tree'
-      runRestart = do
-        theta0 <- VU.replicateM np (randomRIO (-1, 1))
+      runRestart scale = do
+        theta0 <- VU.replicateM np (randomRIO (-scale, scale))
         let (theta, lossVal, _) = minimizeNLLWith funAndGrad VAR1 nIter theta0
         pure (negate lossVal, theta)
-  results <- replicateM nRep runRestart
-  let (bestFitness, bestTheta) = maximumBy (comparing fst) results
-      !thetaText = T.pack (serializeTheta [bestTheta])
-  atomicModifyIORef' counter (\n -> let !n' = n + 1 in (n', ()))
-  unless quiet $ putStrLn $ "  eclass " ++ show eid ++ " (" ++ takeExpr tree' ++ "): fitness=" ++ showFit bestFitness
-  pure (FitResult eid bestFitness thetaText sz)
+      go [] = do
+        atomicModifyIORef' counter (\n -> let !n' = n + 1 in (n', ()))
+        unless quiet $ putStrLn $ "  eclass " ++ show eid ++ " (" ++ takeExpr tree' ++ "): no finite fit (NaN)"
+        pure (FitResult eid (negate (1/0)) (T.pack (serializeTheta [])) sz)
+      go (s : rest) = do
+        rs <- replicateM nRep (runRestart s)
+        let (bf, bt) = maximumBy (comparing fst) rs
+        if isInvalid bf
+          then go rest
+          else do
+            atomicModifyIORef' counter (\n -> let !n' = n + 1 in (n', ()))
+            unless quiet $ putStrLn $ "  eclass " ++ show eid ++ " (" ++ takeExpr tree' ++ "): fitness=" ++ showFit bf
+            pure (FitResult eid bf (T.pack (serializeTheta [bt])) sz)
+  go [1.0, 10.0, 100.0, 1000.0]
 
 -- | Whether a fitness value is unusable (NaN or +/-Infinity), so it can be
 -- pruned and propagated to ancestors.
